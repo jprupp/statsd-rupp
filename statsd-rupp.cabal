@@ -28,6 +28,7 @@ source-repository head
 library
   exposed-modules:
       System.Metrics.StatsD
+      System.Metrics.StatsD.Internal
   other-modules:
       Paths_statsd_rupp
   hs-source-dirs:
@@ -35,6 +36,7 @@ library
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
   build-depends:
       base >=4.7 && <5
+    , bytestring >=0.11.5.1 && <2
     , network >=3.1.4.0 && <4
     , unliftio >=0.2.25 && <2
     , unordered-containers >=0.2.19.1 && <2
@@ -50,6 +52,7 @@ test-suite statsd-rupp-test
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5
+    , bytestring >=0.11.5.1 && <2
     , network >=3.1.4.0 && <4
     , statsd-rupp
     , unliftio >=0.2.25 && <2

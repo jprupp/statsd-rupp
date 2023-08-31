@@ -21,6 +21,7 @@ description:         Please see the README on GitHub at <https://github.com/jpru
 
 dependencies:
 - base >= 4.7 && < 5
+- bytestring >= 0.11.5.1 && < 2
 - network >= 3.1.4.0 && < 4
 - unliftio >= 0.2.25 && < 2
 - unordered-containers >= 0.2.19.1 && < 2

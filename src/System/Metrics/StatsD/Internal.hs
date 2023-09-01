@@ -14,14 +14,19 @@ module System.Metrics.StatsD.Internal
     Counter,
     Gauge,
     Timing,
-    Element,
-    Timings,
-    Set,
+    SetElement,
+    TimingData,
+    SetData,
+    MetricData (..),
     Store (..),
-    Metric (..),
     Metrics,
     Value (..),
+    Sample (..),
     Report (..),
+    StatCounter (..),
+    StatGauge (..),
+    StatTiming (..),
+    StatSet (..),
     addMetric,
     newMetric,
     validateKey,
@@ -46,12 +51,14 @@ module System.Metrics.StatsD.Internal
     stdev,
     median,
     flush,
+    toReport,
+    format,
     submit,
     connectStatsD,
   )
 where
 
-import Control.Monad (forever, when)
+import Control.Monad (forM_, forever, when)
 import Data.ByteString.Char8 qualified as C
 import Data.Char (isAlphaNum, isAscii)
 import Data.HashMap.Strict (HashMap)
@@ -61,7 +68,7 @@ import Data.HashSet qualified as HashSet
 import Data.List (intercalate, sort)
 import Network.Socket (Socket)
 import Network.Socket qualified as Net
-import Network.Socket.ByteString as Net
+import Network.Socket.ByteString qualified as Net
 import Text.Printf (printf)
 import UnliftIO (MonadIO, liftIO)
 import UnliftIO.Concurrent (threadDelay)
@@ -95,8 +102,10 @@ data StatConfig = StatConfig
     server :: !String,
     port :: !Int,
     flushInterval :: !Int,
-    timingPercentiles :: ![Int]
+    timingPercentiles :: ![Int],
+    newline :: !Bool
   }
+  deriving (Show, Read, Eq, Ord)
 
 type Index = Int
 
@@ -108,33 +117,42 @@ type Gauge = Int
 
 type Timing = Int
 
-type Element = String
+type SetElement = String
 
-type Timings = [Int]
+type TimingData = [Int]
 
-type Set = HashSet String
+type SetData = HashSet String
 
-data Store
-  = StoreCounter !Counter
-  | StoreGauge !Gauge
-  | StoreTimings !Timings
-  | StoreSet !Set
+data MetricData
+  = CounterData !Counter
+  | GaugeData !Gauge
+  | TimingData !TimingData
+  | SetData !(HashSet String)
 
-data Metric = Metric
+data Store = Store
   { index :: !Index,
-    store :: !(Maybe Store)
+    dat :: !(Maybe MetricData)
   }
 
-type Metrics = HashMap Key Metric
+type Metrics = HashMap Key Store
 
 data Value
   = Counter !Counter
   | Gauge !Gauge
   | Timing !Timing
-  | Set !Element
+  | Set !SetElement
+  | Metric !Int
+  | Other !String !String
   deriving (Eq, Ord, Show, Read)
 
 data Report = Report
+  { key :: !Key,
+    value :: !Value,
+    rate :: !Double
+  }
+  deriving (Eq, Ord, Show, Read)
+
+data Sample = Sample
   { key :: !Key,
     value :: !Value,
     sampling :: !Sampling,
@@ -142,15 +160,38 @@ data Report = Report
   }
   deriving (Eq, Ord, Show, Read)
 
-addMetric :: StatConfig -> Key -> Store -> Metrics -> Metrics
-addMetric cfg key store =
+data StatCounter = StatCounter
+  { stats :: !Stats,
+    key :: !Key,
+    sampling :: !Sampling
+  }
+
+data StatGauge = StatGauge
+  { stats :: !Stats,
+    key :: !Key,
+    sampling :: !Sampling
+  }
+
+data StatTiming = StatTiming
+  { stats :: !Stats,
+    key :: !Key,
+    sampling :: !Sampling
+  }
+
+data StatSet = StatSet
+  { stats :: !Stats,
+    key :: !Key
+  }
+
+addMetric :: StatConfig -> Key -> MetricData -> Metrics -> Metrics
+addMetric cfg key md =
   HashMap.insert key $
-    Metric 0 $
+    Store 0 $
       if cfg.reportStats
-        then Just store
+        then Just md
         else Nothing
 
-newMetric :: (MonadIO m) => Stats -> Key -> Store -> m Bool
+newMetric :: (MonadIO m) => Stats -> Key -> MetricData -> m Bool
 newMetric stats key store
   | validateKey key =
       atomically $ do
@@ -170,12 +211,12 @@ validateKey t = not (null t) && all valid t
 addReading :: Value -> Key -> Metrics -> Metrics
 addReading reading = HashMap.adjust adjust
   where
-    adjust m = m {index = m.index + 1, store = change <$> m.store}
+    adjust m = m {index = m.index + 1, dat = change <$> m.dat}
     change store = case (reading, store) of
-      (Counter c, StoreCounter s) -> StoreCounter (s + c)
-      (Gauge i, StoreGauge _) -> StoreGauge i
-      (Timing t, StoreTimings s) -> StoreTimings (t : s)
-      (Set e, StoreSet s) -> StoreSet (HashSet.insert e s)
+      (Counter c, CounterData s) -> CounterData (s + c)
+      (Gauge i, GaugeData _) -> GaugeData i
+      (Timing t, TimingData s) -> TimingData (t : s)
+      (Set e, SetData s) -> SetData (HashSet.insert e s)
       _ -> error "Stats reading mismatch"
 
 newReading :: Stats -> Key -> Value -> STM Int
@@ -189,7 +230,7 @@ processSample stats sampling key val = do
   idx <- atomically $ newReading stats key val
   when stats.cfg.reportSamples $
     submit stats $
-      Report key val sampling idx
+      Sample key val sampling idx
 
 newStats :: (MonadIO m) => StatConfig -> m Stats
 newStats cfg = do
@@ -207,52 +248,48 @@ statsFlush stats = do
   reports <-
     atomically $
       stateTVar stats.metrics (flushStats stats.cfg)
-  mapM_ (submit stats) reports
+  mapM_ (send stats) reports
 
 flushStats :: StatConfig -> Metrics -> ([Report], Metrics)
 flushStats cfg metrics =
-  let f xs key m = maybe xs ((<> xs) . statReports cfg key) m.store
+  let f xs key m = maybe xs ((<> xs) . statReports cfg key) m.dat
       rs = HashMap.foldlWithKey' f [] metrics
-      g m = m {store = flush <$> m.store}
+      g m = m {dat = flush <$> m.dat}
       ms = HashMap.map g metrics
    in (rs, ms)
 
 catKey :: [Key] -> Key
 catKey = intercalate "." . filter (not . null)
 
-statReports :: StatConfig -> Key -> Store -> [Report]
-statReports cfg key store = case store of
-  StoreCounter c ->
+statReports :: StatConfig -> Key -> MetricData -> [Report]
+statReports cfg key dat = case dat of
+  CounterData c ->
     [ Report
         { key = catKey [cfg.statsPrefix, cfg.prefixCounter, key, "count"],
           value = Counter c,
-          sampling = 1,
-          index = 0
+          rate = 1.0
         },
       Report
         { key = catKey [cfg.statsPrefix, cfg.prefixCounter, key, "rate"],
           value = Counter (computeRate cfg c),
-          sampling = 1,
-          index = 0
+          rate = 1.0
         }
     ]
-  StoreGauge s ->
+  GaugeData s ->
     [ Report
         { key = catKey [cfg.statsPrefix, cfg.prefixGauge, key],
           value = Gauge s,
-          sampling = 1,
-          index = 0
+          rate = 1.0
         }
     ]
-  StoreSet s ->
+  SetData s ->
     [ Report
         { key = catKey [cfg.statsPrefix, cfg.prefixSet, key, "count"],
           value = Counter (HashSet.size s),
-          sampling = 1,
-          index = 0
+          rate = 1.0
         }
     ]
-  StoreTimings s -> timingReports cfg key s
+  TimingData s -> timingReports cfg key s
 
 data TimingStats = TimingStats
   { timings :: ![Int],
@@ -261,7 +298,7 @@ data TimingStats = TimingStats
   }
   deriving (Eq, Ord, Show, Read)
 
-makeTimingStats :: Timings -> TimingStats
+makeTimingStats :: TimingData -> TimingStats
 makeTimingStats timings =
   TimingStats
     { timings = sorted,
@@ -278,7 +315,7 @@ extractPercentiles =
     . filter (\x -> x > 0 && x < 100)
     . (.timingPercentiles)
 
-timingReports :: StatConfig -> Key -> Timings -> [Report]
+timingReports :: StatConfig -> Key -> TimingData -> [Report]
 timingReports cfg key timings =
   concatMap (timingStats cfg key tstats) percentiles
   where
@@ -302,7 +339,8 @@ percentileSuffix pc
   | otherwise = "_" <> show pc
 
 computeRate :: StatConfig -> Int -> Int
-computeRate cfg i = i `div` (cfg.flushInterval `div` 1000)
+computeRate cfg i =
+  round (fromIntegral i * 1000.0 / fromIntegral cfg.flushInterval :: Double)
 
 timingStats :: StatConfig -> Key -> TimingStats -> Int -> [Report]
 timingStats cfg key tstats pc =
@@ -321,7 +359,7 @@ timingStats cfg key tstats pc =
         ]
     ts = trimPercentile pc tstats
     rate = computeRate cfg (length ts.timings)
-    mkr s v = Report {key = k s, value = v, sampling = 1, index = 0}
+    mkr s v = Report {key = k s, value = v, rate = 1.0}
     stats =
       [ mkr "mean" (Timing (last ts.cumsums `div` length ts.timings)),
         mkr "upper" (Timing (last ts.timings)),
@@ -364,39 +402,57 @@ median ts
   where
     middle = length ts.timings `div` 2
 
-flush :: Store -> Store
-flush (StoreCounter _) = StoreCounter 0
-flush (StoreGauge g) = StoreGauge g
-flush (StoreTimings _) = StoreTimings []
-flush (StoreSet _) = StoreSet HashSet.empty
+flush :: MetricData -> MetricData
+flush (CounterData _) = CounterData 0
+flush (GaugeData g) = GaugeData g
+flush (TimingData _) = TimingData []
+flush (SetData _) = SetData HashSet.empty
+
+toReport :: Sample -> Maybe Report
+toReport sample
+  | sample.sampling > 0 && sample.index `mod` sample.sampling == 0 =
+      Just
+        Report
+          { key = sample.key,
+            value = sample.value,
+            rate = 1.0 / fromIntegral sample.sampling
+          }
+  | otherwise = Nothing
 
 format :: StatConfig -> Report -> String
-format cfg report =
-  printf "%s:%s" key val
+format cfg report
+  | cfg.newline = printf "%s:%s\n" key val
+  | otherwise = printf "%s:%s" key val
   where
     key = catKey [cfg.namespace, report.key]
-    rate :: Int -> String
-    rate i
-      | i > 1 = printf "|@%f" (1.0 / fromIntegral i :: Double)
-      | otherwise = ""
-    val :: String
+    rate
+      | report.rate < 1.0 = printf "|@%f" report.rate
+      | otherwise = "" :: String
     val =
       case report.value of
         Counter i ->
-          printf "%d|c%s" i (rate report.sampling)
+          printf "%d|c%s" i rate
         Gauge g ->
           printf "%d|g" g
         Timing t ->
-          printf "%d|ms%s" t (rate report.sampling)
+          printf "%d|ms%s" t rate
         Set e ->
           printf "%s|s" e
+        Metric m ->
+          printf "%s|m" m
+        Other d t ->
+          printf "%s|%s" t d :: String
 
-submit :: (MonadIO m) => Stats -> Report -> m ()
-submit stats report =
-  when sendit $ liftIO $ Net.sendAll stats.socket msg
-  where
-    msg = C.pack $ format stats.cfg report
-    sendit = report.sampling > 0 && report.index `mod` report.sampling == 0
+submit :: (MonadIO m) => Stats -> Sample -> m ()
+submit stats sample =
+  forM_ (toReport sample) (send stats)
+
+send :: (MonadIO m) => Stats -> Report -> m ()
+send stats report =
+  liftIO $
+    Net.sendAll stats.socket $
+      C.pack $
+        format stats.cfg report
 
 connectStatsD :: (MonadIO m) => String -> Int -> m Socket
 connectStatsD host port = liftIO $ do

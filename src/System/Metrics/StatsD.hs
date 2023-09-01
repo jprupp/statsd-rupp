@@ -23,47 +23,35 @@ module System.Metrics.StatsD
     newSetElement,
     withStats,
     defStatConfig,
+    parseReport,
   )
 where
 
+import Control.Monad (MonadPlus (..))
+import Data.ByteString (ByteString)
+import Data.ByteString.Char8 qualified as C
 import Data.HashSet qualified as HashSet
 import System.Metrics.StatsD.Internal
   ( Key,
+    MetricData (..),
+    Report (..),
     Sampling,
     StatConfig (..),
+    StatCounter (..),
+    StatGauge (..),
+    StatSet (..),
+    StatTiming (..),
     Stats,
-    Store (StoreCounter, StoreGauge, StoreSet, StoreTimings),
-    Value (Counter, Gauge, Set, Timing),
+    Value (..),
     newMetric,
     newStats,
     processSample,
     statsLoop,
+    validateKey,
   )
+import Text.Read (readMaybe)
 import UnliftIO (MonadIO, MonadUnliftIO)
 import UnliftIO.Async (link, withAsync)
-
-data StatCounter = StatCounter
-  { stats :: !Stats,
-    key :: !Key,
-    sampling :: !Sampling
-  }
-
-data StatGauge = StatGauge
-  { stats :: !Stats,
-    key :: !Key,
-    sampling :: !Sampling
-  }
-
-data StatTiming = StatTiming
-  { stats :: !Stats,
-    key :: !Key,
-    sampling :: !Sampling
-  }
-
-data StatSet = StatSet
-  { stats :: !Stats,
-    key :: !Key
-  }
 
 defStatConfig :: StatConfig
 defStatConfig =
@@ -79,13 +67,14 @@ defStatConfig =
       server = "127.0.0.1",
       port = 8125,
       flushInterval = 1000,
-      timingPercentiles = [90, 95]
+      timingPercentiles = [90, 95],
+      newline = False
     }
 
 newStatCounter ::
   (MonadIO m) => Stats -> Key -> Sampling -> m (Maybe StatCounter)
 newStatCounter stats key sampling = do
-  success <- newMetric stats key (StoreCounter 0)
+  success <- newMetric stats key (CounterData 0)
   if success
     then return $ Just $ StatCounter stats key sampling
     else return Nothing
@@ -93,21 +82,21 @@ newStatCounter stats key sampling = do
 newStatGauge ::
   (MonadIO m) => Stats -> Key -> Int -> Int -> m (Maybe StatGauge)
 newStatGauge stats key sampling ini = do
-  success <- newMetric stats key (StoreGauge ini)
+  success <- newMetric stats key (GaugeData ini)
   if success
     then return $ Just $ StatGauge stats key sampling
     else return Nothing
 
 newStatTiming :: (MonadIO m) => Stats -> Key -> Int -> m (Maybe StatTiming)
 newStatTiming stats key sampling = do
-  success <- newMetric stats key (StoreTimings [])
+  success <- newMetric stats key (TimingData [])
   if success
     then return $ Just $ StatTiming stats key sampling
     else return Nothing
 
 newStatSet :: (MonadIO m) => Stats -> Key -> m (Maybe StatSet)
 newStatSet stats key = do
-  success <- newMetric stats key (StoreSet HashSet.empty)
+  success <- newMetric stats key (SetData HashSet.empty)
   if success
     then return $ Just $ StatSet stats key
     else return Nothing
@@ -134,3 +123,41 @@ withStats cfg go = do
   if cfg.reportStats
     then withAsync (statsLoop stats) (\a -> link a >> go stats)
     else go stats
+
+parseReport :: (MonadPlus m) => ByteString -> m Report
+parseReport bs =
+  case C.split '|' bs of
+    [kv, t] -> do
+      (k, v) <- parseKeyValue kv t
+      return $ Report k v 1
+    [kv, t, r] -> do
+      (k, v) <- parseKeyValue kv t
+      x <- parseRate r
+      return $ Report k v x
+    _ -> mzero
+  where
+    parseRead :: (MonadPlus m, Read a) => String -> m a
+    parseRead = maybe mzero return . readMaybe
+    parseKeyValue kv t = do
+      case C.split ':' kv of
+        [k, v] -> do
+          key <- parseKey k
+          value <- parseValue v t
+          return (key, value)
+        _ -> mzero
+    parseKey k =
+      let s = C.unpack k
+       in if validateKey s
+            then return s
+            else mzero
+    parseValue v t =
+      let s = C.unpack v
+       in case t of
+            "c" -> Counter <$> parseRead s
+            "g" -> Gauge <$> parseRead s
+            "s" -> return $ Set s
+            "ms" -> Timing <$> parseRead s
+            _ -> mzero
+    parseRate r = case C.unpack r of
+      '@' : s -> parseRead s
+      _ -> mzero

@@ -53,6 +53,7 @@ test-suite statsd-rupp-test
   build-depends:
       base >=4.7 && <5
     , bytestring >=0.11.5.1 && <2
+    , hspec
     , network >=3.1.4.0 && <4
     , statsd-rupp
     , unliftio >=0.2.25 && <2

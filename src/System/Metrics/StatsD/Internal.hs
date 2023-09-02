@@ -49,6 +49,7 @@ module System.Metrics.StatsD.Internal
     cumulativeSums,
     cumulativeSquares,
     stdev,
+    mean,
     median,
     flush,
     toReport,
@@ -342,6 +343,9 @@ computeRate :: StatConfig -> Int -> Int
 computeRate cfg i =
   round (fromIntegral i * 1000.0 / fromIntegral cfg.flushInterval :: Double)
 
+mean :: TimingStats -> Int
+mean ts = last ts.cumsums `div` length ts.timings
+
 timingStats :: StatConfig -> Key -> TimingStats -> Int -> [Report]
 timingStats cfg key tstats pc =
   mkr "count" (Counter (length ts.timings))
@@ -361,7 +365,7 @@ timingStats cfg key tstats pc =
     rate = computeRate cfg (length ts.timings)
     mkr s v = Report {key = k s, value = v, rate = 1.0}
     stats =
-      [ mkr "mean" (Timing (last ts.cumsums `div` length ts.timings)),
+      [ mkr "mean" (Timing (mean ts)),
         mkr "upper" (Timing (last ts.timings)),
         mkr "lower" (Timing (head ts.timings)),
         mkr "sum" (Timing (last ts.cumsums)),
@@ -376,19 +380,15 @@ cumulativeSums :: (Num a) => [a] -> [a]
 cumulativeSums = scanl1 (+)
 
 cumulativeSquares :: (Num a) => [a] -> [a]
-cumulativeSquares = scanl1 (+) . map (^ (2 :: Int))
+cumulativeSquares = scanl1 (+) . map (\x -> x * x)
 
 stdev :: TimingStats -> Int
 stdev ts =
-  round $ sqrt $ diffsum / mean
+  round $ sqrt var
   where
-    cumsum = fromIntegral $ last ts.cumsums :: Double
-    len = fromIntegral $ length ts.timings :: Double
-    mean = cumsum / len
-    diff x =
-      let d = fromIntegral x - mean :: Double
-       in d * d
-    diffsum = sum $ map diff ts.timings
+    len = length ts.timings
+    var = fromIntegral diffsum / fromIntegral len :: Double
+    diffsum = sum $ map ((^ (2 :: Int)) . subtract (mean ts)) ts.timings
 
 median :: TimingStats -> Int
 median ts

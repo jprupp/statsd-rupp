@@ -26,7 +26,7 @@ main = hspec $ around (withMockStats testConfig) $ do
       Just _ <- newStatCounter stats "planets" 1
       Just _ <- newStatCounter stats "moons" 1
       return () :: Expectation
-    it "reports two counters" $ \(stats, report) -> do
+    it "reports on two counters" $ \(stats, report) -> do
       Just planets <- newStatCounter stats "planets" 1
       Just moons <- newStatCounter stats "moons" 1
       incrementCounter planets 10
@@ -50,7 +50,7 @@ main = hspec $ around (withMockStats testConfig) $ do
       rs `shouldMatchList` rs'
       r <- report
       r.key `shouldNotBe` "moons"
-    it "reports counter stats" $ \(stats, report) -> do
+    it "reports stats" $ \(stats, report) -> do
       Just c <- newStatCounter stats "planets" 4
       replicateM_ 20 (incrementCounter c 10)
       replicateM_ 5 report
@@ -69,14 +69,14 @@ main = hspec $ around (withMockStats testConfig) $ do
               ]
         rs `shouldMatchList` rs'
   describe "timing" $ do
-    it "reports timing events" $ \(stats, report) -> do
+    it "reports events" $ \(stats, report) -> do
       let timings = [51 .. 55]
       Just t <- newStatTiming stats "trips" 1
       forM_ timings (addTiming t)
       rs <- replicateM (length timings) report
       let rs' = map (\n -> Report "trips" (Timing n) 1.0) timings
       rs `shouldMatchList` rs'
-    it "reports empty timing stats" $ \(stats, report) -> do
+    it "reports empty stats" $ \(stats, report) -> do
       Just _ <- newStatTiming stats "holes" 1
       rs <- replicateM 8 report
       let rs' =
@@ -99,7 +99,7 @@ main = hspec $ around (withMockStats testConfig) $ do
                 i `mod` 100 == 0
             ]
       rs `shouldMatchList` rs'
-    it "computes timing stats correctly" $ const $ do
+    it "computes stats" $ const $ do
       let ps = reverse [5 .. 800] ++ [801 .. 1500]
           p90 = take (length ps * 90 `div` 100) (sort ps)
           p95 = take (length ps * 95 `div` 100) (sort ps)
@@ -138,7 +138,7 @@ main = hspec $ around (withMockStats testConfig) $ do
       last t95.cumsquares `shouldBe` sumsq p95
       last t95.cumsums `shouldBe` sum p95
       median t95 `shouldBe` median' p95
-    it "reports timing stats" $ \(stats, report) -> do
+    it "reports stats" $ \(stats, report) -> do
       let timings = [5 .. 1500]
       Just t <- newStatTiming stats "kittens" 0
       forM_ timings (addTiming t)
@@ -184,38 +184,52 @@ main = hspec $ around (withMockStats testConfig) $ do
         rs <- replicateM (length rs') report
         rs `shouldMatchList` rs'
   describe "gauge" $ do
-    it "reports gauge set events" $ \(stats, report) -> do
+    it "reports set events" $ \(stats, report) -> do
       let gauges = [51 .. 55]
-      Just g <- newStatGauge stats "speed" 1 50
+      Just g <- newStatGauge stats "speed" 50
       forM_ gauges (setGauge g)
       rs <- replicateM (length gauges) report
-      let rs' = map (\n -> Report "speed" (Gauge n) 1.0) gauges
+      let rs' = map (\n -> Report "speed" (Gauge n False) 1.0) gauges
       rs `shouldMatchList` rs'
-    it "reports gauge stats" $ \(stats, report) -> do
+    it "reports stats" $ \(stats, report) -> do
       let gauges = [51 .. 55]
-      Just g <- newStatGauge stats "speed" 1 50
+      Just g <- newStatGauge stats "radius" 50
       r <- report
-      r `shouldBe` Report "stats.gauges.speed" (Gauge 50) 1.0
+      r `shouldBe` Report "stats.gauges.radius" (Gauge 50 False) 1.0
       forM_ gauges (setGauge g)
       replicateM_ (length gauges) report
       rs <- replicateM 2 report
-      let rs' = replicate 2 $ Report "stats.gauges.speed" (Gauge 55) 1.0
+      let rs' = replicate 2 $ Report "stats.gauges.radius" (Gauge 55 False) 1.0
       rs `shouldMatchList` rs'
+    it "increments and decrements value" $ \(stats, report) -> do
+      Just g <- newStatGauge stats "breadth" 50
+      incrementGauge g 5
+      report `shouldReturn` Report "breadth" (Gauge 5 True) 1.0
+      report `shouldReturn` Report "stats.gauges.breadth" (Gauge 55 False) 1.0
+      incrementGauge g (-10)
+      report `shouldReturn` Report "breadth" (Gauge (-10) True) 1.0
+      report `shouldReturn` Report "stats.gauges.breadth" (Gauge 45 False) 1.0
+      decrementGauge g 50
+      report `shouldReturn` Report "breadth" (Gauge (-50) True) 1.0
+      report `shouldReturn` Report "stats.gauges.breadth" (Gauge 0 False) 1.0
+      decrementGauge g (-25)
+      report `shouldReturn` Report "breadth" (Gauge 25 True) 1.0
+      report `shouldReturn` Report "stats.gauges.breadth" (Gauge 25 False) 1.0
   describe "set" $ do
-    it "reports set events" $ \(stats, report) -> do
+    it "reports events" $ \(stats, report) -> do
       let set = ["one", "two", "three", "three"]
-      Just s <- newStatSet stats "numbers"
+      Just s <- newStatSet stats "potatoes"
       forM_ set (newSetElement s)
       rs <- replicateM (length set) report
-      let rs' = map (\x -> Report "numbers" (Set x) 1.0) set
+      let rs' = map (\x -> Report "potatoes" (Set x) 1.0) set
       rs `shouldMatchList` rs'
-    it "reports set stats" $ \(stats, report) -> do
+    it "reports stats" $ \(stats, report) -> do
       let set = ["two", "three", "one", "two", "three", "three"]
-      Just s <- newStatSet stats "numbers"
+      Just s <- newStatSet stats "bananas"
       forM_ set (newSetElement s)
       let rs' =
-            [ Report "stats.sets.numbers.count" (Counter 3) 1.0,
-              Report "stats.sets.numbers.count" (Counter 0) 1.0
+            [ Report "stats.sets.bananas.count" (Counter 3) 1.0,
+              Report "stats.sets.bananas.count" (Counter 0) 1.0
             ]
       rs <- replicateM (length set + length rs') report
       rs `shouldEndWith` rs'
@@ -238,7 +252,7 @@ withMockStats cfg go =
   where
     fwd s2 q = forever $ do
       bs <- liftIO $ B.lines <$> recv s2 (2 ^ (20 :: Int))
-      let rs = mapMaybe parseReport bs
+      let rs = map (fromJust . parseReport) bs
       mapM_ (atomically . writeTQueue q) rs
 
 withMockSockets :: (MonadUnliftIO m) => ((Socket, Socket) -> m a) -> m a

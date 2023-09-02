@@ -15,7 +15,7 @@ module System.Metrics.StatsD.Internal
     Gauge,
     Timing,
     SetElement,
-    TimingData,
+    Timings,
     SetData,
     MetricData (..),
     Store (..),
@@ -120,14 +120,14 @@ type Timing = Int
 
 type SetElement = String
 
-type TimingData = [Int]
+type Timings = [Int]
 
 type SetData = HashSet String
 
 data MetricData
   = CounterData !Counter
   | GaugeData !Gauge
-  | TimingData !TimingData
+  | TimingData !Timings
   | SetData !(HashSet String)
 
 data Store = Store
@@ -139,7 +139,7 @@ type Metrics = HashMap Key Store
 
 data Value
   = Counter !Counter
-  | Gauge !Gauge
+  | Gauge !Gauge !Bool
   | Timing !Timing
   | Set !SetElement
   | Metric !Int
@@ -169,8 +169,7 @@ data StatCounter = StatCounter
 
 data StatGauge = StatGauge
   { stats :: !Stats,
-    key :: !Key,
-    sampling :: !Sampling
+    key :: !Key
   }
 
 data StatTiming = StatTiming
@@ -215,7 +214,8 @@ addReading reading = HashMap.adjust adjust
     adjust m = m {index = m.index + 1, dat = change <$> m.dat}
     change store = case (reading, store) of
       (Counter c, CounterData s) -> CounterData (s + c)
-      (Gauge i, GaugeData _) -> GaugeData i
+      (Gauge i False, GaugeData _) -> GaugeData i
+      (Gauge i True, GaugeData g) -> GaugeData (max 0 (g + i))
       (Timing t, TimingData s) -> TimingData (t : s)
       (Set e, SetData s) -> SetData (HashSet.insert e s)
       _ -> error "Stats reading mismatch"
@@ -279,7 +279,7 @@ statReports cfg key dat = case dat of
   GaugeData s ->
     [ Report
         { key = catKey [cfg.statsPrefix, cfg.prefixGauge, key],
-          value = Gauge s,
+          value = Gauge s False,
           rate = 1.0
         }
     ]
@@ -299,7 +299,7 @@ data TimingStats = TimingStats
   }
   deriving (Eq, Ord, Show, Read)
 
-makeTimingStats :: TimingData -> TimingStats
+makeTimingStats :: Timings -> TimingStats
 makeTimingStats timings =
   TimingStats
     { timings = sorted,
@@ -316,7 +316,7 @@ extractPercentiles =
     . filter (\x -> x > 0 && x < 100)
     . (.timingPercentiles)
 
-timingReports :: StatConfig -> Key -> TimingData -> [Report]
+timingReports :: StatConfig -> Key -> Timings -> [Report]
 timingReports cfg key timings =
   concatMap (timingStats cfg key tstats) percentiles
   where
@@ -432,8 +432,10 @@ format cfg report
       case report.value of
         Counter i ->
           printf "%d|c%s" i rate
-        Gauge g ->
+        Gauge g False ->
           printf "%d|g" g
+        Gauge g True ->
+          printf "%+d|g" g
         Timing t ->
           printf "%d|ms%s" t rate
         Set e ->

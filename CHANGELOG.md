@@ -8,6 +8,10 @@ and this project adheres to the
 
 ## Unreleased
 
+## 0.2.0.0 - 2023-09-02
+
+- Fix gauges.
+
 ## 0.1.0.0 - 2023-09-02
 
 - Initial release.

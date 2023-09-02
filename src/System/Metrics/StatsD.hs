@@ -19,6 +19,8 @@ module System.Metrics.StatsD
     newStatSet,
     incrementCounter,
     setGauge,
+    incrementGauge,
+    decrementGauge,
     addTiming,
     newSetElement,
     withStats,
@@ -80,11 +82,11 @@ newStatCounter stats key sampling = do
     else return Nothing
 
 newStatGauge ::
-  (MonadIO m) => Stats -> Key -> Int -> Int -> m (Maybe StatGauge)
-newStatGauge stats key sampling ini = do
+  (MonadIO m) => Stats -> Key -> Int -> m (Maybe StatGauge)
+newStatGauge stats key ini = do
   success <- newMetric stats key (GaugeData ini)
   if success
-    then return $ Just $ StatGauge stats key sampling
+    then return $ Just $ StatGauge stats key
     else return Nothing
 
 newStatTiming :: (MonadIO m) => Stats -> Key -> Int -> m (Maybe StatTiming)
@@ -106,8 +108,15 @@ incrementCounter StatCounter {..} =
   processSample stats sampling key . Counter
 
 setGauge :: (MonadIO m) => StatGauge -> Int -> m ()
-setGauge StatGauge {..} =
-  processSample stats sampling key . Gauge
+setGauge StatGauge {..} i =
+  processSample stats 1 key (Gauge i False)
+
+incrementGauge :: (MonadIO m) => StatGauge -> Int -> m ()
+incrementGauge StatGauge {..} i =
+  processSample stats 1 key (Gauge i True)
+
+decrementGauge :: (MonadIO m) => StatGauge -> Int -> m ()
+decrementGauge x i = incrementGauge x (negate i)
 
 addTiming :: (MonadIO m) => StatTiming -> Int -> m ()
 addTiming StatTiming {..} =
@@ -154,7 +163,11 @@ parseReport bs =
       let s = C.unpack v
        in case t of
             "c" -> Counter <$> parseRead s
-            "g" -> Gauge <$> parseRead s
+            "g" ->
+              case s of
+                '+' : n -> Gauge <$> parseRead n <*> pure True
+                '-' : _ -> Gauge <$> parseRead s <*> pure True
+                _ -> Gauge <$> parseRead s <*> pure False
             "s" -> return $ Set s
             "ms" -> Timing <$> parseRead s
             _ -> mzero

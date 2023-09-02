@@ -59,7 +59,7 @@ module System.Metrics.StatsD.Internal
   )
 where
 
-import Control.Monad (forM_, forever, when)
+import Control.Monad (forM_, forever, void, when)
 import Data.ByteString.Char8 qualified as C
 import Data.Char (isAlphaNum, isAscii)
 import Data.HashMap.Strict (HashMap)
@@ -71,7 +71,7 @@ import Network.Socket (Socket)
 import Network.Socket qualified as Net
 import Network.Socket.ByteString qualified as Net
 import Text.Printf (printf)
-import UnliftIO (MonadIO, liftIO, throwIO)
+import UnliftIO (MonadIO, handleIO, liftIO, throwIO)
 import UnliftIO.Concurrent (threadDelay)
 import UnliftIO.STM
   ( STM,
@@ -457,9 +457,10 @@ submit stats sample =
 send :: (MonadIO m) => Stats -> Report -> m ()
 send stats report =
   liftIO $
-    Net.sendAll stats.socket $
-      C.pack $
-        format stats.cfg report
+    handleIO (const (return ())) $
+      void $
+        Net.send stats.socket $
+          C.pack (format stats.cfg report)
 
 connectStatsD :: (MonadIO m) => String -> Int -> m Socket
 connectStatsD host port = liftIO $ do

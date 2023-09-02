@@ -1,5 +1,5 @@
 name:                statsd-rupp
-version:             0.2.0.0
+version:             0.3.0.0
 github:              "jprupp/statsd-rupp"
 license:             BSD3
 author:              "Jean-Pieerre Rupp"

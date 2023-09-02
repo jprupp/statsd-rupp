@@ -71,7 +71,7 @@ import Network.Socket (Socket)
 import Network.Socket qualified as Net
 import Network.Socket.ByteString qualified as Net
 import Text.Printf (printf)
-import UnliftIO (MonadIO, liftIO)
+import UnliftIO (MonadIO, liftIO, throwIO)
 import UnliftIO.Concurrent (threadDelay)
 import UnliftIO.STM
   ( STM,
@@ -191,17 +191,22 @@ addMetric cfg key md =
         then Just md
         else Nothing
 
-newMetric :: (MonadIO m) => Stats -> Key -> MetricData -> m Bool
+newMetric :: (MonadIO m) => Stats -> Key -> MetricData -> m ()
 newMetric stats key store
-  | validateKey key =
-      atomically $ do
+  | validateKey key = do
+      e <- atomically $ do
         exists <- HashMap.member key <$> readTVar stats.metrics
         if exists
-          then return False
+          then return True
           else do
             modifyTVar stats.metrics (addMetric stats.cfg key store)
-            return True
-  | otherwise = return False
+            return False
+      when e $
+        throwIO $
+          userError $
+            "A metric already exists with key: " <> key
+  | otherwise =
+      throwIO $ userError $ "Metric key is invalid: " <> key
 
 validateKey :: String -> Bool
 validateKey t = not (null t) && all valid t

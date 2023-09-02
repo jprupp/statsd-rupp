@@ -8,6 +8,10 @@ and this project adheres to the
 
 ## Unreleased
 
+## 0.3.0.0 - 2023-09-02
+
+- Throw errors instead of returning Maybe when creating metrics sharing a key.
+
 ## 0.2.0.0 - 2023-09-02
 
 - Fix gauges.

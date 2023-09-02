@@ -74,34 +74,26 @@ defStatConfig =
     }
 
 newStatCounter ::
-  (MonadIO m) => Stats -> Key -> Sampling -> m (Maybe StatCounter)
+  (MonadIO m) => Stats -> Key -> Sampling -> m StatCounter
 newStatCounter stats key sampling = do
-  success <- newMetric stats key (CounterData 0)
-  if success
-    then return $ Just $ StatCounter stats key sampling
-    else return Nothing
+  newMetric stats key (CounterData 0)
+  return $ StatCounter stats key sampling
 
 newStatGauge ::
-  (MonadIO m) => Stats -> Key -> Int -> m (Maybe StatGauge)
+  (MonadIO m) => Stats -> Key -> Int -> m StatGauge
 newStatGauge stats key ini = do
-  success <- newMetric stats key (GaugeData ini)
-  if success
-    then return $ Just $ StatGauge stats key
-    else return Nothing
+  newMetric stats key (GaugeData ini)
+  return $ StatGauge stats key
 
-newStatTiming :: (MonadIO m) => Stats -> Key -> Int -> m (Maybe StatTiming)
+newStatTiming :: (MonadIO m) => Stats -> Key -> Int -> m StatTiming
 newStatTiming stats key sampling = do
-  success <- newMetric stats key (TimingData [])
-  if success
-    then return $ Just $ StatTiming stats key sampling
-    else return Nothing
+  newMetric stats key (TimingData [])
+  return $ StatTiming stats key sampling
 
-newStatSet :: (MonadIO m) => Stats -> Key -> m (Maybe StatSet)
+newStatSet :: (MonadIO m) => Stats -> Key -> m StatSet
 newStatSet stats key = do
-  success <- newMetric stats key (SetData HashSet.empty)
-  if success
-    then return $ Just $ StatSet stats key
-    else return Nothing
+  newMetric stats key (SetData HashSet.empty)
+  return $ StatSet stats key
 
 incrementCounter :: (MonadIO m) => StatCounter -> Int -> m ()
 incrementCounter StatCounter {..} =

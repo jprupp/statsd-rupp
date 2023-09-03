@@ -8,6 +8,8 @@ and this project adheres to the
 
 ## Unreleased
 
+- Code and test refactoring.
+
 ## 0.3.0.1 - 2023-09-02
 
 - Ignore IO errors when sending UDP packets to the network.

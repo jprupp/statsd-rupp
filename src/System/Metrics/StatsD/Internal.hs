@@ -353,33 +353,24 @@ mean ts = last ts.cumsums `div` length ts.timings
 
 timingStats :: StatConfig -> Key -> TimingStats -> Int -> [Report]
 timingStats cfg key tstats pc =
-  mkr "count" (Counter (length ts.timings))
-    : [mkr "count_ps" (Counter rate) | 100 <= pc]
-      <> if null ts.timings
-        then []
-        else stats
+  concat
+    [ [mkr "count" (Counter (length ts.timings))],
+      [mkr "std" (Timing (stdev ts)) | 100 <= pc, not empty],
+      [mkr "count_ps" (Counter rate) | 100 <= pc],
+      [mkr "mean" (Timing (mean ts)) | not empty],
+      [mkr "upper" (Timing (last ts.timings)) | not empty],
+      [mkr "lower" (Timing (head ts.timings)) | not empty],
+      [mkr "sum" (Timing (last ts.cumsums)) | not empty],
+      [mkr "sum_squares" (Timing (last ts.cumsquares)) | not empty],
+      [mkr "median" (Timing (median ts)) | not empty]
+    ]
   where
-    k s =
-      catKey
-        [ cfg.statsPrefix,
-          cfg.prefixTimer,
-          key,
-          s <> percentileSuffix pc
-        ]
     ts = trimPercentile pc tstats
+    empty = null ts.timings
     rate = computeRate cfg (length ts.timings)
-    mkr s v = Report {key = k s, value = v, rate = 1.0}
-    stats =
-      [ mkr "mean" (Timing (mean ts)),
-        mkr "upper" (Timing (last ts.timings)),
-        mkr "lower" (Timing (head ts.timings)),
-        mkr "sum" (Timing (last ts.cumsums)),
-        mkr "sum_squares" (Timing (last ts.cumsquares)),
-        mkr "median" (Timing (median ts))
-      ]
-        <> [ mkr "std" (Timing (stdev ts))
-             | 100 <= pc
-           ]
+    sfx = percentileSuffix pc
+    tk = catKey [cfg.statsPrefix, cfg.prefixTimer, key]
+    mkr s v = Report {key = catKey [tk, s <> sfx], value = v, rate = 1.0}
 
 cumulativeSums :: (Num a) => [a] -> [a]
 cumulativeSums = scanl1 (+)

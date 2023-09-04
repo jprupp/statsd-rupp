@@ -28,6 +28,7 @@ module System.Metrics.StatsD
   )
 where
 
+import Control.Monad (when)
 import Data.ByteString.Char8 qualified as C
 import Data.HashSet qualified as HashSet
 import System.Metrics.StatsD.Internal
@@ -46,7 +47,7 @@ import System.Metrics.StatsD.Internal
     processSample,
     statsLoop,
   )
-import UnliftIO (MonadIO, MonadUnliftIO)
+import UnliftIO (MonadIO, MonadUnliftIO, throwIO)
 import UnliftIO.Async (link, withAsync)
 
 type Key = String
@@ -72,6 +73,9 @@ defStatConfig =
 newStatCounter ::
   (MonadIO m) => Stats -> Key -> Int -> m StatCounter
 newStatCounter stats key sampling = do
+  when (sampling < 0) $
+    throwIO $
+      userError "Counter sampling rate should not be negative"
   newMetric stats (C.pack key) (CounterData 0)
   return $ StatCounter stats (C.pack key) sampling
 
@@ -83,6 +87,9 @@ newStatGauge stats key ini = do
 
 newStatTiming :: (MonadIO m) => Stats -> Key -> Int -> m StatTiming
 newStatTiming stats key sampling = do
+  when (sampling < 0) $
+    throwIO $
+      userError "Timing sampling rate should not be negative"
   newMetric stats (C.pack key) (TimingData [])
   return $ StatTiming stats (C.pack key) sampling
 

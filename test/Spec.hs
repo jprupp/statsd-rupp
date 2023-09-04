@@ -21,6 +21,17 @@ import Test.Hspec
 import Test.Hspec.QuickCheck
 import Test.QuickCheck
 import UnliftIO
+  ( MonadIO (liftIO),
+    MonadUnliftIO,
+    atomically,
+    bracket,
+    link,
+    newTQueueIO,
+    newTVarIO,
+    readTQueue,
+    withAsync,
+    writeTQueue,
+  )
 
 main :: IO ()
 main = hspec $ do
@@ -214,22 +225,39 @@ main = hspec $ do
         forM_ gauges (setGauge g)
         replicateM_ (length gauges) report
         rs <- replicateM 2 report
-        let rs' = replicate 2 $ Report "stats.gauges.radius" (Gauge 55 False) 1.0
+        let rs' =
+              replicate 2 $
+                Report "stats.gauges.radius" (Gauge 55 False) 1.0
         rs `shouldMatchList` rs'
       it "increments and decrements value" $ \(stats, report) -> do
         g <- newStatGauge stats "breadth" 50
+        let sk = "breadth"
+            tk = "stats.gauges.breadth"
+            r k v t = Report k (Gauge v t) 1.0
         incrementGauge g 5
-        report `shouldReturn` Report "breadth" (Gauge 5 True) 1.0
-        report `shouldReturn` Report "stats.gauges.breadth" (Gauge 55 False) 1.0
+        report `shouldReturn` r sk 5 True
+        report `shouldReturn` r tk 55 False
         incrementGauge g (-10)
-        report `shouldReturn` Report "breadth" (Gauge (-10) True) 1.0
-        report `shouldReturn` Report "stats.gauges.breadth" (Gauge 45 False) 1.0
+        report `shouldReturn` r sk (-10) True
+        report `shouldReturn` r tk 45 False
         decrementGauge g 50
-        report `shouldReturn` Report "breadth" (Gauge (-50) True) 1.0
-        report `shouldReturn` Report "stats.gauges.breadth" (Gauge 0 False) 1.0
+        report `shouldReturn` r sk (-50) True
+        report `shouldReturn` r tk 0 False
         decrementGauge g (-25)
-        report `shouldReturn` Report "breadth" (Gauge 25 True) 1.0
-        report `shouldReturn` Report "stats.gauges.breadth" (Gauge 25 False) 1.0
+        report `shouldReturn` r sk 25 True
+        report `shouldReturn` r tk 25 False
+        incrementGauge g maxBound
+        report `shouldReturn` r sk maxBound True
+        report `shouldReturn` r tk maxBound False
+        decrementGauge g minBound
+        report `shouldReturn` r sk minBound True
+        report `shouldReturn` r tk 0 False
+        incrementGauge g maxBound
+        report `shouldReturn` r sk maxBound True
+        report `shouldReturn` r tk maxBound False
+        decrementGauge g 5
+        report `shouldReturn` r sk (-5) True
+        report `shouldReturn` r tk (maxBound - 5) False
     describe "set" $ do
       it "reports events" $ \(stats, report) -> do
         let set = ["one", "two", "three", "three"]
@@ -327,14 +355,11 @@ instance Arbitrary Value where
     oneof [counter, gauge, timing, set]
     where
       counter = Counter <$> genNatural
-      timing = Timing <$> arbitrary
+      timing = Timing <$> genNatural
       set = Set <$> genValidString
       gauge = do
         t <- arbitrary
-        v <-
-          if t
-            then arbitrary
-            else genNatural
+        v <- if t then arbitrary else genNatural
         return $ Gauge v t
 
 instance Arbitrary Report where

@@ -8,6 +8,8 @@ and this project adheres to the
 
 ## Unreleased
 
+- Improve resilience against bad input.
+
 ## 0.4.0.0 - 2023-09-04
 
 - Use vectors where pertient.

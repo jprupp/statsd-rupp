@@ -35,7 +35,6 @@ module System.Metrics.StatsD.Internal
     statReports,
     TimingStats (..),
     makeTimingStats,
-    extractPercentiles,
     timingReports,
     trimPercentile,
     percentileSuffix,
@@ -56,7 +55,7 @@ module System.Metrics.StatsD.Internal
   )
 where
 
-import Control.Monad (MonadPlus (..), forM_, forever, void, when)
+import Control.Monad (MonadPlus (..), forM_, forever, guard, unless, void, when)
 import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -68,7 +67,7 @@ import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
-import Data.List (sort)
+import Data.List (nub, sort)
 import Data.Vector (Vector, (!))
 import Data.Vector qualified as V
 import Network.Socket (Socket)
@@ -188,39 +187,48 @@ addMetric params key dat =
       if params.stats then Just dat else Nothing
 
 newMetric :: (MonadIO m) => Stats -> ByteString -> MetricData -> m ()
-newMetric stats key store
-  | validateKey key = do
-      e <- atomically $ do
-        exists <- HashMap.member key <$> readTVar stats.metrics
-        if exists
-          then return True
-          else do
-            modifyTVar
-              stats.metrics
-              (addMetric stats.params key store)
-            return False
-      when e $
-        throwIO $
-          userError $
-            "A metric already exists with key: " <> C.unpack key
-  | otherwise =
-      throwIO $ userError $ "Metric key is invalid: " <> C.unpack key
+newMetric stats key store = do
+  unless (validateKey key) $ do
+    throwIO $ userError "Metric key is invalid"
+  e <- atomically $ do
+    exists <- HashMap.member key <$> readTVar stats.metrics
+    if exists
+      then return True
+      else do
+        modifyTVar
+          stats.metrics
+          (addMetric stats.params key store)
+        return False
+  when e $ throwIO $ userError $ "StatsD key exists: " <> C.unpack key
 
 validateKey :: ByteString -> Bool
 validateKey t = not (C.null t) && C.all valid t
   where
     valid c = elem c ("._-" :: [Char]) || isAscii c && isAlphaNum c
 
+validateValue :: Value -> Bool
+validateValue (Counter c) = c > 0
+validateValue (Gauge g False) = g > 0
+validateValue (Gauge _ True) = True
+validateValue (Timing t) = t > 0
+validateValue (Set e) = validateKey e
+
 addReading :: Value -> ByteString -> Metrics -> Metrics
 addReading reading = HashMap.adjust adjust
   where
     adjust m = m {index = m.index + 1, dat = change <$> m.dat}
     change store = case (reading, store) of
-      (Counter c, CounterData s) -> CounterData (s + c)
-      (Gauge i False, GaugeData _) -> GaugeData i
-      (Gauge i True, GaugeData g) -> GaugeData (max 0 (g + i))
-      (Timing t, TimingData s) -> TimingData (t : s)
-      (Set e, SetData s) -> SetData (HashSet.insert e s)
+      (Counter c, CounterData s) ->
+        CounterData (s + c)
+      (Gauge i False, GaugeData _) ->
+        GaugeData i
+      (Gauge i True, GaugeData g)
+        | i > maxBound - g -> GaugeData maxBound
+        | otherwise -> GaugeData (max 0 (g + i))
+      (Timing t, TimingData s) ->
+        TimingData (t : s)
+      (Set e, SetData s) ->
+        SetData (HashSet.insert e s)
       _ -> error "Stats reading mismatch"
 
 newReading :: Stats -> ByteString -> Value -> STM Int
@@ -232,6 +240,12 @@ newReading stats key reading = do
 processSample ::
   (MonadIO m) => Stats -> Int -> ByteString -> Value -> m ()
 processSample stats sampling key val = do
+  when (0 > sampling) $
+    throwIO $
+      userError "StatsD sampling rate must not be negative"
+  unless (validateValue val) $
+    throwIO $
+      userError "StatsD value is not valid"
   idx <- atomically $ newReading stats key val
   when stats.params.samples $
     submit stats $
@@ -241,28 +255,38 @@ newMetrics :: (MonadIO m) => m (TVar Metrics)
 newMetrics = newTVarIO HashMap.empty
 
 newParams :: StatConfig -> StatParams
-newParams cfg =
-  StatParams
-    { pfx = p,
-      pfxCounter = s <> C.pack cfg.prefixCounter <> ".",
-      pfxGauge = s <> C.pack cfg.prefixGauge <> ".",
-      pfxTimer = s <> C.pack cfg.prefixTimer <> ".",
-      pfxSet = s <> C.pack cfg.prefixSet <> ".",
-      newline = cfg.appendNewline,
-      stats = cfg.reportStats,
-      samples = cfg.reportSamples,
-      percentiles = extractPercentiles cfg,
-      flush = abs cfg.flushInterval
-    }
+newParams cfg
+  | v =
+      StatParams
+        { pfx = pfx,
+          pfxCounter = s <> bc <> ".",
+          pfxGauge = s <> bg <> ".",
+          pfxTimer = s <> bt <> ".",
+          pfxSet = s <> be <> ".",
+          newline = cfg.appendNewline,
+          stats = cfg.reportStats,
+          samples = cfg.reportSamples,
+          percentiles = 100 : nub cfg.timingPercentiles,
+          flush = cfg.flushInterval
+        }
+  | otherwise = error "StatsD config invalid"
   where
-    p =
+    bn = C.pack cfg.namespace
+    bs = C.pack cfg.prefixStats
+    bg = C.pack cfg.prefixGauge
+    bc = C.pack cfg.prefixCounter
+    bt = C.pack cfg.prefixTimer
+    be = C.pack cfg.prefixSet
+    v =
+      all validateKey [bs, bg, bc, bt, be]
+        && bool (validateKey bn) True (null cfg.namespace)
+        && 0 <= cfg.flushInterval
+        && all (\pc -> pc > 0 && 100 > pc) cfg.timingPercentiles
+    pfx =
       if null cfg.namespace
         then ""
-        else C.pack cfg.namespace <> "."
-    s =
-      if null cfg.prefixStats
-        then p
-        else p <> C.pack cfg.prefixStats <> "."
+        else bn <> "."
+    s = pfx <> bs <> "."
 
 newStats :: StatConfig -> TVar Metrics -> Socket -> Stats
 newStats cfg metrics socket =
@@ -340,14 +364,6 @@ makeTimingStats timings =
     }
   where
     sorted = sort timings
-
-extractPercentiles :: StatConfig -> [Int]
-extractPercentiles =
-  (100 :)
-    . HashSet.toList
-    . HashSet.fromList
-    . filter (\x -> x > 0 && x < 100)
-    . (.timingPercentiles)
 
 timingReports :: StatParams -> ByteString -> [Int] -> [Report]
 timingReports params key timings =
@@ -504,22 +520,29 @@ parseReport bs =
     parseKeyValue kv t = do
       case C.split ':' kv of
         [key, v] -> do
+          guard (validateKey key)
           value <- parseValue v t
           return (key, value)
         _ -> mzero
     parseValue v t =
       case C.unpack t of
-        "c" -> Counter <$> parseRead v
+        "c" -> Counter <$> parseNatural v
         "g" ->
           case C.uncons v of
-            Just ('+', n) -> Gauge <$> parseInt n <*> pure True
+            Just ('+', _) -> Gauge <$> parseInt v <*> pure True
             Just ('-', _) -> Gauge <$> parseInt v <*> pure True
-            _ -> Gauge <$> parseRead v <*> pure False
-        "s" -> return $ Set v
-        "ms" -> Timing <$> parseRead v
+            _ -> Gauge <$> parseNatural v <*> pure False
+        "s" -> do
+          guard (validateKey v)
+          return (Set v)
+        "ms" -> Timing <$> parseNatural v
         _ -> mzero
     parseRate r = case C.uncons r of
-      Just ('@', s) -> parseRead s
+      Just ('@', s) -> do
+        t <- parseRead s
+        guard (t > 0.0)
+        guard (t < 1.0)
+        return t
       _ -> mzero
 
 parseRead :: (MonadPlus m, Read a) => ByteString -> m a
@@ -528,4 +551,9 @@ parseRead = maybe mzero return . readMaybe . C.unpack
 parseInt :: (MonadPlus m) => ByteString -> m Int
 parseInt bs = case C.readInt bs of
   Just (i, bs') | B.null bs' -> return i
+  _ -> mzero
+
+parseNatural :: (MonadPlus m) => ByteString -> m Int
+parseNatural bs = case C.readInt bs of
+  Just (i, bs') | B.null bs' -> guard (0 <= i) >> return i
   _ -> mzero

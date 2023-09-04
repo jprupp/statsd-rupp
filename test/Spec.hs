@@ -3,23 +3,30 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 import Control.Monad
-import Data.ByteString.Char8 qualified as B
+import Data.ByteString (ByteString)
+import Data.ByteString.Char8 qualified as C
+import Data.Char
 import Data.HashMap.Strict qualified as HashMap
 import Data.List (sort)
 import Data.Maybe
+import Data.Vector qualified as V
 import Network.Socket
 import Network.Socket.ByteString
 import System.Metrics.StatsD
 import System.Metrics.StatsD.Internal
 import Test.Hspec
 import Test.Hspec.QuickCheck
-import Test.QuickCheck ((==>))
+import Test.QuickCheck
 import UnliftIO
 
 main :: IO ()
 main = hspec $ do
+  describe "parser" $ do
+    prop "formats and parses a report" $ \r ->
+      (parseReport . formatReport) r `shouldBe` Just r
   describe "statistics" $ do
     prop "calculates timing lengths" $ \ps -> do
       let ts = makeTimingStats ps
@@ -53,21 +60,21 @@ main = hspec $ do
     prop "computes sums" $ \ps ->
       not (null ps) ==> do
         let ts = makeTimingStats ps
-        last ts.cumsums `shouldBe` sum ps
+        V.last ts.cumsums `shouldBe` sum ps
     prop "computes p75 and p95 sums" $ \ps ->
       2 <= length ps ==> do
         let ts = makeTimingStats ps
-        last (trimPercentile 95 ts).cumsums `shouldBe` sum (percent 95 ps)
-        last (trimPercentile 75 ts).cumsums `shouldBe` sum (percent 75 ps)
+        V.last (trimPercentile 95 ts).cumsums `shouldBe` sum (percent 95 ps)
+        V.last (trimPercentile 75 ts).cumsums `shouldBe` sum (percent 75 ps)
     prop "computes sum of squares" $ \ps ->
       not (null ps) ==> do
         let ts = makeTimingStats ps
-        last ts.cumsquares `shouldBe` sumsq ps
+        V.last ts.cumsquares `shouldBe` sumsq ps
     prop "computes p75 and p95 sum of squares" $ \ps ->
       2 <= length ps ==> do
         let ts = makeTimingStats ps
-        last (trimPercentile 95 ts).cumsquares `shouldBe` sumsq (percent 95 ps)
-        last (trimPercentile 75 ts).cumsquares `shouldBe` sumsq (percent 75 ps)
+        V.last (trimPercentile 95 ts).cumsquares `shouldBe` sumsq (percent 95 ps)
+        V.last (trimPercentile 75 ts).cumsquares `shouldBe` sumsq (percent 75 ps)
   around (withMockStats testConfig) $ do
     describe "counter" $ do
       it "creates two counters" $ \(stats, _) -> do
@@ -126,16 +133,15 @@ main = hspec $ do
         rs `shouldMatchList` rs'
       it "reports empty stats" $ \(stats, report) -> do
         _ <- newStatTiming stats "holes" 1
-        rs <- replicateM 8 report
-        let rs' =
-              concatMap
-                (replicate 2)
+        replicateM_ 2 $ do
+          let rs' =
                 [ Report "stats.timers.holes.count" (Counter 0) 1.0,
                   Report "stats.timers.holes.count_ps" (Counter 0) 1.0,
                   Report "stats.timers.holes.count_90" (Counter 0) 1.0,
                   Report "stats.timers.holes.count_95" (Counter 0) 1.0
                 ]
-        rs `shouldMatchList` rs'
+          rs <- replicateM (length rs') report
+          rs `shouldMatchList` rs'
       it "filters reported samples" $ \(stats, report) -> do
         let timings = [1001 .. 2000]
         t <- newStatTiming stats "cats" 100
@@ -230,7 +236,7 @@ main = hspec $ do
         s <- newStatSet stats "potatoes"
         forM_ set (newSetElement s)
         rs <- replicateM (length set) report
-        let rs' = map (\x -> Report "potatoes" (Set x) 1.0) set
+        let rs' = map (\x -> Report "potatoes" (Set (C.pack x)) 1.0) set
         rs `shouldMatchList` rs'
       it "reports stats" $ \(stats, report) -> do
         let set = ["two", "three", "one", "two", "three", "three"]
@@ -254,13 +260,13 @@ withMockStats cfg go =
     withAsync (fwd s2 q) $ \a1 -> do
       link a1
       m <- newTVarIO HashMap.empty
-      let s = Stats m cfg {newline = True} s1
+      let s = newStats cfg {appendNewline = True} m s1
       withAsync (statsLoop s) $ \a2 -> do
         link a2
         go (s, atomically (readTQueue q))
   where
     fwd s2 q = forever $ do
-      bs <- liftIO $ B.lines <$> recv s2 (2 ^ (20 :: Int))
+      bs <- liftIO $ C.lines <$> recv s2 (2 ^ (20 :: Int))
       let rs = map (fromJust . parseReport) bs
       mapM_ (atomically . writeTQueue q) rs
 
@@ -299,3 +305,45 @@ std ls =
       s = fromIntegral $ sumsq ds :: Double
       v = s / l
    in round (sqrt v)
+
+genValidString :: Gen ByteString
+genValidString =
+  C.pack <$> listOf1 (arbitraryASCIIChar `suchThat` isValidChar)
+
+isValidChar :: Char -> Bool
+isValidChar c =
+  isAscii c && (isAlpha c || isNumber c || isWhitelist c)
+  where
+    isWhitelist = flip elem (".-_" :: [Char])
+
+genRate :: Gen Double
+genRate = arbitrary `suchThat` \n -> n > 0.0 && n <= 1.0
+
+genNatural :: Gen Int
+genNatural = arbitrary `suchThat` (0 <=)
+
+instance Arbitrary Value where
+  arbitrary =
+    oneof [counter, gauge, timing, set]
+    where
+      counter = Counter <$> genNatural
+      timing = Timing <$> arbitrary
+      set = Set <$> genValidString
+      gauge = do
+        t <- arbitrary
+        v <-
+          if t
+            then arbitrary
+            else genNatural
+        return $ Gauge v t
+
+instance Arbitrary Report where
+  arbitrary = do
+    key <- genValidString
+    value <- arbitrary
+    rate <- case value of
+      Counter {} -> genRate
+      Gauge {} -> pure 1.0
+      Timing {} -> genRate
+      Set {} -> pure 1.0
+    return $ Report key value rate

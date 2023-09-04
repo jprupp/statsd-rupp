@@ -8,6 +8,11 @@ and this project adheres to the
 
 ## Unreleased
 
+## 0.4.0.0 - 2023-09-04
+
+- Use vectors where pertient.
+- Use bytestrings internally.
+- Change configuration parameters.
 - Code and test refactoring.
 
 ## 0.3.0.1 - 2023-09-02

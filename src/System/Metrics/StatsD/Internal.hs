@@ -7,19 +7,14 @@
 
 module System.Metrics.StatsD.Internal
   ( Stats (..),
+    newStats,
+    StatParams,
+    newParams,
     StatConfig (..),
-    Key,
-    Index,
-    Sampling,
-    Counter,
-    Gauge,
-    Timing,
-    SetElement,
-    Timings,
-    SetData,
     MetricData (..),
     Store (..),
     Metrics,
+    newMetrics,
     Value (..),
     Sample (..),
     Report (..),
@@ -33,7 +28,6 @@ module System.Metrics.StatsD.Internal
     addReading,
     newReading,
     processSample,
-    newStats,
     statsLoop,
     statsFlush,
     flushStats,
@@ -53,24 +47,35 @@ module System.Metrics.StatsD.Internal
     median,
     flush,
     toReport,
-    format,
+    formatReport,
     submit,
     connectStatsD,
+    parseReport,
+    parseRead,
+    parseInt,
   )
 where
 
-import Control.Monad (forM_, forever, void, when)
+import Control.Monad (MonadPlus (..), forM_, forever, void, when)
+import Data.Bool (bool)
+import Data.ByteString (ByteString)
+import Data.ByteString qualified as B
+import Data.ByteString.Builder (byteString, char8, intDec, string8, toLazyByteString)
 import Data.ByteString.Char8 qualified as C
+import Data.ByteString.Lazy qualified as L
 import Data.Char (isAlphaNum, isAscii)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet (HashSet)
 import Data.HashSet qualified as HashSet
-import Data.List (intercalate, sort)
+import Data.List (sort)
+import Data.Vector (Vector, (!))
+import Data.Vector qualified as V
 import Network.Socket (Socket)
 import Network.Socket qualified as Net
 import Network.Socket.ByteString qualified as Net
 import Text.Printf (printf)
+import Text.Read (readMaybe)
 import UnliftIO (MonadIO, handleIO, liftIO, throwIO)
 import UnliftIO.Concurrent (threadDelay)
 import UnliftIO.STM
@@ -83,115 +88,106 @@ import UnliftIO.STM
     stateTVar,
   )
 
-type Key = String
-
 data Stats = Stats
   { metrics :: !(TVar Metrics),
-    cfg :: !StatConfig,
-    socket :: !Socket
+    socket :: !Socket,
+    params :: !StatParams
+  }
+
+data StatParams = StatParams
+  { pfx :: !ByteString,
+    pfxCounter :: !ByteString,
+    pfxTimer :: !ByteString,
+    pfxGauge :: !ByteString,
+    pfxSet :: !ByteString,
+    flush :: !Int,
+    stats :: !Bool,
+    samples :: !Bool,
+    percentiles :: ![Int],
+    newline :: !Bool
   }
 
 data StatConfig = StatConfig
   { reportStats :: !Bool,
     reportSamples :: !Bool,
     namespace :: !String,
-    statsPrefix :: !String,
+    prefixStats :: !String,
     prefixCounter :: !String,
     prefixTimer :: !String,
     prefixGauge :: !String,
     prefixSet :: !String,
-    server :: !String,
-    port :: !Int,
+    statsdServer :: !String,
+    statsdPort :: !Int,
     flushInterval :: !Int,
     timingPercentiles :: ![Int],
-    newline :: !Bool
+    appendNewline :: !Bool
   }
   deriving (Show, Read, Eq, Ord)
 
-type Index = Int
-
-type Sampling = Int
-
-type Counter = Int
-
-type Gauge = Int
-
-type Timing = Int
-
-type SetElement = String
-
-type Timings = [Int]
-
-type SetData = HashSet String
-
 data MetricData
-  = CounterData !Counter
-  | GaugeData !Gauge
-  | TimingData !Timings
-  | SetData !(HashSet String)
+  = CounterData !Int
+  | GaugeData !Int
+  | TimingData ![Int]
+  | SetData !(HashSet ByteString)
 
 data Store = Store
-  { index :: !Index,
+  { index :: !Int,
     dat :: !(Maybe MetricData)
   }
 
-type Metrics = HashMap Key Store
+type Metrics = HashMap ByteString Store
 
 data Value
-  = Counter !Counter
-  | Gauge !Gauge !Bool
-  | Timing !Timing
-  | Set !SetElement
-  | Metric !Int
-  | Other !String !String
+  = Counter !Int
+  | Gauge !Int !Bool
+  | Timing !Int
+  | Set !ByteString
   deriving (Eq, Ord, Show, Read)
 
 data Report = Report
-  { key :: !Key,
+  { key :: !ByteString,
     value :: !Value,
     rate :: !Double
   }
   deriving (Eq, Ord, Show, Read)
 
 data Sample = Sample
-  { key :: !Key,
+  { key :: !ByteString,
     value :: !Value,
-    sampling :: !Sampling,
-    index :: !Index
+    sampling :: !Int,
+    index :: !Int
   }
   deriving (Eq, Ord, Show, Read)
 
 data StatCounter = StatCounter
   { stats :: !Stats,
-    key :: !Key,
-    sampling :: !Sampling
+    key :: !ByteString,
+    sampling :: !Int
   }
 
 data StatGauge = StatGauge
   { stats :: !Stats,
-    key :: !Key
+    key :: !ByteString
   }
 
 data StatTiming = StatTiming
   { stats :: !Stats,
-    key :: !Key,
-    sampling :: !Sampling
+    key :: !ByteString,
+    sampling :: !Int
   }
 
 data StatSet = StatSet
   { stats :: !Stats,
-    key :: !Key
+    key :: !ByteString
   }
 
-addMetric :: StatConfig -> Key -> MetricData -> Metrics -> Metrics
-addMetric cfg key md =
+addMetric :: StatParams -> ByteString -> MetricData -> Metrics -> Metrics
+addMetric params key dat =
   HashMap.insert key $
     Store 0 $
-      if cfg.reportStats
-        then Just md
-        else Nothing
+      if params.stats then Just dat else Nothing
 
-newMetric :: (MonadIO m) => Stats -> Key -> MetricData -> m ()
+newMetric :: (MonadIO m) => Stats -> ByteString -> MetricData -> m ()
 newMetric stats key store
   | validateKey key = do
       e <- atomically $ do
@@ -199,21 +195,23 @@ newMetric stats key store
         if exists
           then return True
           else do
-            modifyTVar stats.metrics (addMetric stats.cfg key store)
+            modifyTVar
+              stats.metrics
+              (addMetric stats.params key store)
             return False
       when e $
         throwIO $
           userError $
-            "A metric already exists with key: " <> key
+            "A metric already exists with key: " <> C.unpack key
   | otherwise =
-      throwIO $ userError $ "Metric key is invalid: " <> key
+      throwIO $ userError $ "Metric key is invalid: " <> C.unpack key
 
-validateKey :: String -> Bool
-validateKey t = not (null t) && all valid t
+validateKey :: ByteString -> Bool
+validateKey t = not (C.null t) && C.all valid t
   where
     valid c = elem c ("._-" :: [Char]) || isAscii c && isAlphaNum c
 
-addReading :: Value -> Key -> Metrics -> Metrics
+addReading :: Value -> ByteString -> Metrics -> Metrics
 addReading reading = HashMap.adjust adjust
   where
     adjust m = m {index = m.index + 1, dat = change <$> m.dat}
@@ -225,108 +223,137 @@ addReading reading = HashMap.adjust adjust
       (Set e, SetData s) -> SetData (HashSet.insert e s)
       _ -> error "Stats reading mismatch"
 
-newReading :: Stats -> Key -> Value -> STM Int
+newReading :: Stats -> ByteString -> Value -> STM Int
 newReading stats key reading = do
   modifyTVar stats.metrics (addReading reading key)
-  maybe 0 (.index) . HashMap.lookup key <$> readTVar stats.metrics
+  maybe 0 (.index) . HashMap.lookup key
+    <$> readTVar stats.metrics
 
 processSample ::
-  (MonadIO m) => Stats -> Sampling -> Key -> Value -> m ()
+  (MonadIO m) => Stats -> Int -> ByteString -> Value -> m ()
 processSample stats sampling key val = do
   idx <- atomically $ newReading stats key val
-  when stats.cfg.reportSamples $
+  when stats.params.samples $
     submit stats $
       Sample key val sampling idx
 
-newStats :: (MonadIO m) => StatConfig -> m Stats
-newStats cfg = do
-  m <- newTVarIO HashMap.empty
-  h <- connectStatsD cfg.server cfg.port
-  return $ Stats m cfg h
+newMetrics :: (MonadIO m) => m (TVar Metrics)
+newMetrics = newTVarIO HashMap.empty
+
+newParams :: StatConfig -> StatParams
+newParams cfg =
+  StatParams
+    { pfx = p,
+      pfxCounter = s <> C.pack cfg.prefixCounter <> ".",
+      pfxGauge = s <> C.pack cfg.prefixGauge <> ".",
+      pfxTimer = s <> C.pack cfg.prefixTimer <> ".",
+      pfxSet = s <> C.pack cfg.prefixSet <> ".",
+      newline = cfg.appendNewline,
+      stats = cfg.reportStats,
+      samples = cfg.reportSamples,
+      percentiles = extractPercentiles cfg,
+      flush = abs cfg.flushInterval
+    }
+  where
+    p =
+      if null cfg.namespace
+        then ""
+        else C.pack cfg.namespace <> "."
+    s =
+      if null cfg.prefixStats
+        then p
+        else p <> C.pack cfg.prefixStats <> "."
+
+newStats :: StatConfig -> TVar Metrics -> Socket -> Stats
+newStats cfg metrics socket =
+  Stats
+    { metrics = metrics,
+      socket = socket,
+      params = newParams cfg
+    }
 
 statsLoop :: (MonadIO m) => Stats -> m ()
 statsLoop stats = forever $ do
-  threadDelay $ stats.cfg.flushInterval * 1000
+  threadDelay (stats.params.flush * 1000)
   statsFlush stats
 
 statsFlush :: (MonadIO m) => Stats -> m ()
 statsFlush stats = do
-  reports <-
-    atomically $
-      stateTVar stats.metrics (flushStats stats.cfg)
-  mapM_ (send stats) reports
+  mapM_ (send stats)
+    =<< atomically
+      (stateTVar stats.metrics (flushStats stats.params))
 
-flushStats :: StatConfig -> Metrics -> ([Report], Metrics)
-flushStats cfg metrics =
-  let f xs key m = maybe xs ((<> xs) . statReports cfg key) m.dat
+flushStats :: StatParams -> Metrics -> ([Report], Metrics)
+flushStats params metrics =
+  let f xs key m = maybe xs ((<> xs) . statReports params key) m.dat
       rs = HashMap.foldlWithKey' f [] metrics
       g m = m {dat = flush <$> m.dat}
       ms = HashMap.map g metrics
    in (rs, ms)
 
-catKey :: [Key] -> Key
-catKey = intercalate "." . filter (not . null)
+catKey :: [ByteString] -> ByteString
+catKey = C.intercalate "." . filter (not . C.null)
 
-statReports :: StatConfig -> Key -> MetricData -> [Report]
-statReports cfg key dat = case dat of
+statReports :: StatParams -> ByteString -> MetricData -> [Report]
+statReports params key dat = case dat of
   CounterData c ->
     [ Report
-        { key = catKey [cfg.statsPrefix, cfg.prefixCounter, key, "count"],
+        { key = params.pfxCounter <> key <> ".count",
           value = Counter c,
           rate = 1.0
         },
       Report
-        { key = catKey [cfg.statsPrefix, cfg.prefixCounter, key, "rate"],
-          value = Counter (computeRate cfg c),
+        { key = params.pfxCounter <> key <> ".rate",
+          value = Counter (computeRate params c),
           rate = 1.0
         }
     ]
   GaugeData s ->
     [ Report
-        { key = catKey [cfg.statsPrefix, cfg.prefixGauge, key],
+        { key = params.pfxGauge <> key,
           value = Gauge s False,
           rate = 1.0
         }
     ]
   SetData s ->
     [ Report
-        { key = catKey [cfg.statsPrefix, cfg.prefixSet, key, "count"],
+        { key = params.pfxSet <> key <> ".count",
           value = Counter (HashSet.size s),
           rate = 1.0
         }
     ]
-  TimingData s -> timingReports cfg key s
+  TimingData s -> timingReports params key s
 
 data TimingStats = TimingStats
-  { timings :: ![Int],
-    cumsums :: ![Int],
-    cumsquares :: ![Int]
+  { timings :: !(Vector Int),
+    cumsums :: !(Vector Int),
+    cumsquares :: !(Vector Int)
   }
   deriving (Eq, Ord, Show, Read)
 
-makeTimingStats :: Timings -> TimingStats
+makeTimingStats :: [Int] -> TimingStats
 makeTimingStats timings =
   TimingStats
-    { timings = sorted,
-      cumsums = cumulativeSums sorted,
-      cumsquares = cumulativeSquares sorted
+    { timings = V.fromList sorted,
+      cumsums = V.fromList (cumulativeSums sorted),
+      cumsquares = V.fromList (cumulativeSquares sorted)
     }
   where
     sorted = sort timings
 
 extractPercentiles :: StatConfig -> [Int]
 extractPercentiles =
-  HashSet.toList
+  (100 :)
+    . HashSet.toList
     . HashSet.fromList
     . filter (\x -> x > 0 && x < 100)
     . (.timingPercentiles)
 
-timingReports :: StatConfig -> Key -> Timings -> [Report]
-timingReports cfg key timings =
-  concatMap (timingStats cfg key tstats) percentiles
+timingReports :: StatParams -> ByteString -> [Int] -> [Report]
+timingReports params key timings =
+  concatMap (timingStats params key tstats) params.percentiles
   where
     tstats = makeTimingStats timings
-    percentiles = 100 : extractPercentiles cfg
 
 trimPercentile :: Int -> TimingStats -> TimingStats
 trimPercentile pc ts =
@@ -336,41 +363,39 @@ trimPercentile pc ts =
       cumsquares = f ts.cumsquares
     }
   where
-    f ls = take (length ls * pc `div` 100) ls
+    f ls = V.take (length ls * pc `div` 100) ls
 
-percentileSuffix :: Int -> String
+percentileSuffix :: Int -> ByteString
 percentileSuffix pc
-  | 100 <= pc = ""
-  | 0 > pc = "0"
-  | otherwise = "_" <> show pc
+  | pc == 100 = ""
+  | otherwise = C.pack $ printf "_%d" pc
 
-computeRate :: StatConfig -> Int -> Int
-computeRate cfg i =
-  round (fromIntegral i * 1000.0 / fromIntegral cfg.flushInterval :: Double)
+computeRate :: StatParams -> Int -> Int
+computeRate params i = i * 1000 `div` params.flush
 
 mean :: TimingStats -> Int
-mean ts = last ts.cumsums `div` length ts.timings
+mean ts = V.last ts.cumsums `div` length ts.timings
 
-timingStats :: StatConfig -> Key -> TimingStats -> Int -> [Report]
-timingStats cfg key tstats pc =
+timingStats :: StatParams -> ByteString -> TimingStats -> Int -> [Report]
+timingStats params key tstats pc =
   concat
     [ [mkr "count" (Counter (length ts.timings))],
-      [mkr "std" (Timing (stdev ts)) | 100 <= pc, not empty],
-      [mkr "count_ps" (Counter rate) | 100 <= pc],
+      [mkr "count_ps" (Counter rate) | pc == 100],
+      [mkr "std" (Timing (stdev ts)) | pc == 100, not empty],
       [mkr "mean" (Timing (mean ts)) | not empty],
-      [mkr "upper" (Timing (last ts.timings)) | not empty],
-      [mkr "lower" (Timing (head ts.timings)) | not empty],
-      [mkr "sum" (Timing (last ts.cumsums)) | not empty],
-      [mkr "sum_squares" (Timing (last ts.cumsquares)) | not empty],
+      [mkr "upper" (Timing (V.last ts.timings)) | not empty],
+      [mkr "lower" (Timing (V.head ts.timings)) | not empty],
+      [mkr "sum" (Timing (V.last ts.cumsums)) | not empty],
+      [mkr "sum_squares" (Timing (V.last ts.cumsquares)) | not empty],
       [mkr "median" (Timing (median ts)) | not empty]
     ]
   where
     ts = trimPercentile pc tstats
     empty = null ts.timings
-    rate = computeRate cfg (length ts.timings)
+    rate = computeRate params (length ts.timings)
     sfx = percentileSuffix pc
-    tk = catKey [cfg.statsPrefix, cfg.prefixTimer, key]
-    mkr s v = Report {key = catKey [tk, s <> sfx], value = v, rate = 1.0}
+    pfx = params.pfxTimer <> key <> "."
+    mkr s v = Report {key = pfx <> s <> sfx, value = v, rate = 1.0}
 
 cumulativeSums :: (Num a) => [a] -> [a]
 cumulativeSums = scanl1 (+)
@@ -383,18 +408,18 @@ stdev ts =
   round $ sqrt var
   where
     len = length ts.timings
-    var = fromIntegral diffsum / fromIntegral len :: Double
-    diffsum = sum $ map ((^ (2 :: Int)) . subtract (mean ts)) ts.timings
+    var = fromIntegral ds / fromIntegral len :: Double
+    ds = sum $ map ((^ (2 :: Int)) . subtract (mean ts)) (V.toList ts.timings)
 
 median :: TimingStats -> Int
 median ts
   | null ts.timings = 0
   | even (length ts.timings) =
-      let lower = ts.timings !! middle
-          upper = ts.timings !! subtract 1 middle
+      let lower = ts.timings ! middle
+          upper = ts.timings ! subtract 1 middle
        in (lower + upper) `div` 2
   | otherwise =
-      ts.timings !! middle
+      ts.timings ! middle
   where
     middle = length ts.timings `div` 2
 
@@ -415,31 +440,27 @@ toReport sample
           }
   | otherwise = Nothing
 
-format :: StatConfig -> Report -> String
-format cfg report
-  | cfg.newline = printf "%s:%s\n" key val
-  | otherwise = printf "%s:%s" key val
+formatReport :: Report -> ByteString
+formatReport report = L.toStrict $ toLazyByteString builder
   where
-    key = catKey [cfg.namespace, report.key]
+    builder = byteString report.key <> char8 ':' <> val
     rate
-      | report.rate < 1.0 = printf "|@%f" report.rate
-      | otherwise = "" :: String
+      | report.rate < 1.0 =
+          string8 $ printf "|@%f" report.rate
+      | otherwise = mempty
     val =
       case report.value of
         Counter i ->
-          printf "%d|c%s" i rate
+          intDec i <> "|c" <> rate
         Gauge g False ->
-          printf "%d|g" g
+          intDec g <> "|g"
         Gauge g True ->
-          printf "%+d|g" g
+          let sign = if 0 <= g then char8 '+' else mempty
+           in sign <> intDec g <> "|g"
         Timing t ->
-          printf "%d|ms%s" t rate
+          intDec t <> "|ms" <> rate
         Set e ->
-          printf "%s|s" e
-        Metric m ->
-          printf "%s|m" m
-        Other d t ->
-          printf "%s|%s" t d :: String
+          byteString e <> "|s"
 
 submit :: (MonadIO m) => Stats -> Sample -> m ()
 submit stats sample =
@@ -450,8 +471,9 @@ send stats report =
   liftIO $
     handleIO (const (return ())) $
       void $
-        Net.send stats.socket $
-          C.pack (format stats.cfg report)
+        Net.send
+          stats.socket
+          (formatReport report <> bool "" "\n" stats.params.newline)
 
 connectStatsD :: (MonadIO m) => String -> Int -> m Socket
 connectStatsD host port = liftIO $ do
@@ -466,3 +488,44 @@ connectStatsD host port = liftIO $ do
   sock <- Net.socket (Net.addrFamily a) Net.Datagram Net.defaultProtocol
   Net.connect sock (Net.addrAddress a)
   return sock
+
+parseReport :: (MonadPlus m) => ByteString -> m Report
+parseReport bs =
+  case C.split '|' bs of
+    [kv, t] -> do
+      (k, v) <- parseKeyValue kv t
+      return $ Report k v 1.0
+    [kv, t, r] -> do
+      (k, v) <- parseKeyValue kv t
+      x <- parseRate r
+      return $ Report k v x
+    _ -> mzero
+  where
+    parseKeyValue kv t = do
+      case C.split ':' kv of
+        [key, v] -> do
+          value <- parseValue v t
+          return (key, value)
+        _ -> mzero
+    parseValue v t =
+      case C.unpack t of
+        "c" -> Counter <$> parseRead v
+        "g" ->
+          case C.uncons v of
+            Just ('+', n) -> Gauge <$> parseInt n <*> pure True
+            Just ('-', _) -> Gauge <$> parseInt v <*> pure True
+            _ -> Gauge <$> parseRead v <*> pure False
+        "s" -> return $ Set v
+        "ms" -> Timing <$> parseRead v
+        _ -> mzero
+    parseRate r = case C.uncons r of
+      Just ('@', s) -> parseRead s
+      _ -> mzero
+
+parseRead :: (MonadPlus m, Read a) => ByteString -> m a
+parseRead = maybe mzero return . readMaybe . C.unpack
+
+parseInt :: (MonadPlus m) => ByteString -> m Int
+parseInt bs = case C.readInt bs of
+  Just (i, bs') | B.null bs' -> return i
+  _ -> mzero

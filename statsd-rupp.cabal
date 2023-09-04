@@ -5,7 +5,7 @@ cabal-version: 1.12
 -- see: https://github.com/sol/hpack
 
 name:           statsd-rupp
-version:        0.3.0.1
+version:        0.4.0.0
 synopsis:       Simple StatsD Client
 description:    Please see the README on GitHub at <https://github.com/jprupp/statsd-rupp#readme>
 category:       System
@@ -40,6 +40,7 @@ library
     , network >=3.1.4.0 && <4
     , unliftio >=0.2.25 && <2
     , unordered-containers >=0.2.19.1 && <2
+    , vector >=0.13.0 && <2
   default-language: Haskell2010
 
 test-suite statsd-rupp-test
@@ -59,4 +60,5 @@ test-suite statsd-rupp-test
     , statsd-rupp
     , unliftio >=0.2.25 && <2
     , unordered-containers >=0.2.19.1 && <2
+    , vector >=0.13.0 && <2
   default-language: Haskell2010

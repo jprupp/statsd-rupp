@@ -280,7 +280,7 @@ newParams cfg
     v =
       all validateKey [bs, bg, bc, bt, be]
         && bool (validateKey bn) True (null cfg.namespace)
-        && 0 <= cfg.flushInterval
+        && cfg.flushInterval > 0
         && all (\pc -> pc > 0 && 100 > pc) cfg.timingPercentiles
     pfx =
       if null cfg.namespace

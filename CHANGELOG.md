@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
+## 0.4.0.3 - 2023-09-11
+
+- Show invalid value and key.
+
 ## 0.4.0.2 - 2023-09-05
 
 - Flush interval cannot be zero or below.

@@ -245,7 +245,11 @@ processSample stats sampling key val = do
       userError "StatsD sampling rate must not be negative"
   unless (validateValue val) $
     throwIO $
-      userError "StatsD value is not valid"
+      userError $
+        "StatsD value is not valid for key \""
+          <> C.unpack key
+          <> "\": "
+          <> show val
   idx <- atomically $ newReading stats key val
   when stats.params.samples $
     submit stats $

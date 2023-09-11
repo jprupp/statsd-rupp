@@ -5,7 +5,7 @@ cabal-version: 1.12
 -- see: https://github.com/sol/hpack
 
 name:           statsd-rupp
-version:        0.4.0.2
+version:        0.4.0.3
 synopsis:       Simple StatsD Client
 description:    Please see the README on GitHub at <https://github.com/jprupp/statsd-rupp#readme>
 category:       System

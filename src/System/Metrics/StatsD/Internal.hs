@@ -206,13 +206,6 @@ validateKey t = not (C.null t) && C.all valid t
   where
     valid c = elem c ("._-" :: [Char]) || isAscii c && isAlphaNum c
 
-validateValue :: Value -> Bool
-validateValue (Counter c) = c > 0
-validateValue (Gauge g False) = g > 0
-validateValue (Gauge _ True) = True
-validateValue (Timing t) = t > 0
-validateValue (Set e) = validateKey e
-
 addReading :: Value -> ByteString -> Metrics -> Metrics
 addReading reading = HashMap.adjust adjust
   where
@@ -240,16 +233,6 @@ newReading stats key reading = do
 processSample ::
   (MonadIO m) => Stats -> Int -> ByteString -> Value -> m ()
 processSample stats sampling key val = do
-  when (0 > sampling) $
-    throwIO $
-      userError "StatsD sampling rate must not be negative"
-  unless (validateValue val) $
-    throwIO $
-      userError $
-        "StatsD value is not valid for key \""
-          <> C.unpack key
-          <> "\": "
-          <> show val
   idx <- atomically $ newReading stats key val
   when stats.params.samples $
     submit stats $

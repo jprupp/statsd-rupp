@@ -243,13 +243,13 @@ newMetrics = newTVarIO HashMap.empty
 
 newParams :: StatConfig -> StatParams
 newParams cfg
-  | v =
+  | valid =
       StatParams
-        { pfx = pfx,
-          pfxCounter = s <> bc <> ".",
-          pfxGauge = s <> bg <> ".",
-          pfxTimer = s <> bt <> ".",
-          pfxSet = s <> be <> ".",
+        { pfx = pfx_namespace,
+          pfxCounter = full_pfx_stats <> counters <> ".",
+          pfxGauge = full_pfx_stats <> gauges <> ".",
+          pfxTimer = full_pfx_stats <> timers <> ".",
+          pfxSet = full_pfx_stats <> sets <> ".",
           newline = cfg.appendNewline,
           stats = cfg.reportStats,
           samples = cfg.reportSamples,
@@ -258,22 +258,22 @@ newParams cfg
         }
   | otherwise = error "StatsD config invalid"
   where
-    bn = C.pack cfg.namespace
-    bs = C.pack cfg.prefixStats
-    bg = C.pack cfg.prefixGauge
-    bc = C.pack cfg.prefixCounter
-    bt = C.pack cfg.prefixTimer
-    be = C.pack cfg.prefixSet
-    v =
-      all validateKey [bs, bg, bc, bt, be]
-        && bool (validateKey bn) True (null cfg.namespace)
+    namespace = C.pack cfg.namespace
+    pfx_stats = C.pack cfg.prefixStats
+    gauges = C.pack cfg.prefixGauge
+    counters = C.pack cfg.prefixCounter
+    timers = C.pack cfg.prefixTimer
+    sets = C.pack cfg.prefixSet
+    valid =
+      all validateKey [pfx_stats, gauges, counters, timers, sets]
+        && bool (validateKey namespace) True (C.null namespace)
         && cfg.flushInterval > 0
         && all (\pc -> pc > 0 && 100 > pc) cfg.timingPercentiles
-    pfx =
-      if null cfg.namespace
+    pfx_namespace =
+      if C.null namespace
         then ""
-        else bn <> "."
-    s = pfx <> bs <> "."
+        else namespace <> "."
+    full_pfx_stats = pfx_namespace <> pfx_stats <> "."
 
 newStats :: StatConfig -> TVar Metrics -> Socket -> Stats
 newStats cfg metrics socket =
@@ -432,12 +432,12 @@ flush (GaugeData g) = GaugeData g
 flush (TimingData _) = TimingData []
 flush (SetData _) = SetData HashSet.empty
 
-toReport :: Sample -> Maybe Report
-toReport sample
+toReport :: StatParams -> Sample -> Maybe Report
+toReport params sample
   | sample.sampling > 0 && sample.index `mod` sample.sampling == 0 =
       Just
         Report
-          { key = sample.key,
+          { key = params.pfx <> sample.key,
             value = sample.value,
             rate = 1.0 / fromIntegral sample.sampling
           }
@@ -467,7 +467,7 @@ formatReport report = L.toStrict $ toLazyByteString builder
 
 submit :: (MonadIO m) => Stats -> Sample -> m ()
 submit stats sample =
-  forM_ (toReport sample) (send stats)
+  forM_ (toReport stats.params sample) (send stats)
 
 send :: (MonadIO m) => Stats -> Report -> m ()
 send stats report =

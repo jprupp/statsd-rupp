@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
+## 0.5.0.1 - 2025-05-09
+
+- Bump LTS Haskell.
+- Simplify author name.
+
 ## 0.5.0.0 - 2024-05-22
 
 - Fix namespace not showing up in samples.

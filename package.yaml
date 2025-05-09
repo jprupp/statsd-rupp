@@ -1,10 +1,9 @@
 name:                statsd-rupp
-version:             0.5.0.0
-github:              "jprupp/statsd-rupp"
+version:             0.5.0.1
+github:              jprupp/statsd-rupp
 license:             BSD3
-author:              "Jean-Pieerre Rupp"
-maintainer:          "jprupp@protonmail.ch"
-copyright:           "2024 Jean-Pierre Rupp"
+author:              JP Rupp
+maintainer:          jprupp@protonmail.ch
 
 extra-source-files:
 - README.md

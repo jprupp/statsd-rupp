@@ -135,7 +135,7 @@ If your resolver does not include it, add it to `stack.yaml`:
 
 ```yaml
 extra-deps:
-  - statsd-rupp-0.5.0.1
+  - statsd-rupp-0.5.0.2
 ```
 
 ## Quick start

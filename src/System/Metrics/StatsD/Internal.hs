@@ -5,6 +5,22 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+-- |
+-- Module      : System.Metrics.StatsD.Internal
+-- Copyright   : (c) 2023 JP Rupp
+-- License     : BSD3
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- Implementation details of "System.Metrics.StatsD". This module is exposed for
+-- testing and for advanced use. Its API may change between minor versions.
+--
+-- Metrics are kept in a 'HashMap' from key to 'Store' inside a 'TVar'. Every
+-- reading updates the aggregated 'MetricData' of its metric and increments a
+-- per-metric counter, which is used to decide which samples to send when
+-- sampling. A background loop ('statsLoop') periodically turns the aggregated
+-- data into 'Report's, sends them, and resets the data ('flush').
 module System.Metrics.StatsD.Internal
   ( Stats (..),
     newStats,
@@ -87,105 +103,182 @@ import UnliftIO.STM
     stateTVar,
   )
 
+-- | Handle to a StatsD client. Create one with
+-- 'System.Metrics.StatsD.withStats'. It can be shared between threads.
 data Stats = Stats
-  { metrics :: !(TVar Metrics),
+  { -- | registered metrics and their aggregated data
+    metrics :: !(TVar Metrics),
+    -- | UDP socket connected to the StatsD server
     socket :: !Socket,
+    -- | settings derived from the 'StatConfig'
     params :: !StatParams
   }
 
+-- | Settings derived from a 'StatConfig' by 'newParams', with the prefixes
+-- already joined and encoded.
 data StatParams = StatParams
-  { pfx :: !ByteString,
+  { -- | namespace followed by a dot, or empty; prepended to samples
+    pfx :: !ByteString,
+    -- | full prefix for counter statistics, ending in a dot
     pfxCounter :: !ByteString,
+    -- | full prefix for timing statistics, ending in a dot
     pfxTimer :: !ByteString,
+    -- | full prefix for gauge statistics, ending in a dot
     pfxGauge :: !ByteString,
+    -- | full prefix for set statistics, ending in a dot
     pfxSet :: !ByteString,
+    -- | flush interval in milliseconds
     flush :: !Int,
+    -- | whether aggregated statistics are kept and reported
     stats :: !Bool,
+    -- | whether individual samples are reported
     samples :: !Bool,
+    -- | percentiles to compute for timings, always including 100
     percentiles :: ![Int],
+    -- | whether to append a newline to each line sent
     newline :: !Bool
   }
 
+-- | Client configuration. Start from 'System.Metrics.StatsD.defStatConfig' and
+-- change the fields you need.
 data StatConfig = StatConfig
-  { reportStats :: !Bool,
+  { -- | aggregate samples and send statistics every 'flushInterval'
+    reportStats :: !Bool,
+    -- | send every sample (subject to sampling) as it happens
     reportSamples :: !Bool,
+    -- | prefix for every metric name; empty for none
     namespace :: !String,
+    -- | prefix for aggregated statistics, after the namespace
     prefixStats :: !String,
+    -- | prefix for counter statistics, after 'prefixStats'
     prefixCounter :: !String,
+    -- | prefix for timing statistics, after 'prefixStats'
     prefixTimer :: !String,
+    -- | prefix for gauge statistics, after 'prefixStats'
     prefixGauge :: !String,
+    -- | prefix for set statistics, after 'prefixStats'
     prefixSet :: !String,
+    -- | host name or IP address of the StatsD server
     statsdServer :: !String,
+    -- | UDP port of the StatsD server
     statsdPort :: !Int,
+    -- | milliseconds between flushes of aggregated statistics; must be
+    -- positive
     flushInterval :: !Int,
+    -- | percentiles to compute for timings, each strictly between 0 and 100
     timingPercentiles :: ![Int],
+    -- | append a newline to each line sent, as some servers require
     appendNewline :: !Bool
   }
   deriving (Show, Read, Eq, Ord)
 
+-- | Aggregated data of a metric during the current flush interval.
 data MetricData
-  = CounterData !Int
-  | GaugeData !Int
-  | TimingData ![Int]
-  | SetData !(HashSet ByteString)
+  = -- | sum of increments
+    CounterData !Int
+  | -- | current value
+    GaugeData !Int
+  | -- | timings recorded, most recent first
+    TimingData ![Int]
+  | -- | distinct elements seen
+    SetData !(HashSet ByteString)
 
+-- | State of a registered metric.
 data Store = Store
-  { index :: !Int,
+  { -- | number of readings so far, used for sampling
+    index :: !Int,
+    -- | aggregated data, or 'Nothing' if statistics are not reported
     dat :: !(Maybe MetricData)
   }
 
+-- | All registered metrics, by key.
 type Metrics = HashMap ByteString Store
 
+-- | A single reading, or the value of a report.
 data Value
-  = Counter !Int
-  | Gauge !Int !Bool
-  | Timing !Int
-  | Set !ByteString
+  = -- | counter increment (@|c@)
+    Counter !Int
+  | -- | gauge value; if the flag is 'True' it is a relative change and is sent
+    -- with an explicit sign (@|g@)
+    Gauge !Int !Bool
+  | -- | timing in milliseconds (@|ms@)
+    Timing !Int
+  | -- | set element (@|s@)
+    Set !ByteString
   deriving (Eq, Ord, Show, Read)
 
+-- | A line to send to the StatsD server, in the form
+-- @key:value|type[|\@rate]@.
 data Report = Report
-  { key :: !ByteString,
+  { -- | full metric name
+    key :: !ByteString,
+    -- | value and type
     value :: !Value,
+    -- | sampling rate between 0 and 1; only sent if below 1
     rate :: !Double
   }
   deriving (Eq, Ord, Show, Read)
 
+-- | A reading together with what is needed to decide whether to send it.
 data Sample = Sample
-  { key :: !ByteString,
+  { -- | metric key, without namespace
+    key :: !ByteString,
+    -- | the reading
     value :: !Value,
+    -- | send one in this many readings; @0@ to send none
     sampling :: !Int,
+    -- | number of readings of this metric so far, including this one
     index :: !Int
   }
   deriving (Eq, Ord, Show, Read)
 
+-- | Handle to a counter. Create with 'System.Metrics.StatsD.newStatCounter'.
 data StatCounter = StatCounter
-  { stats :: !Stats,
+  { -- | client the counter belongs to
+    stats :: !Stats,
+    -- | metric key
     key :: !ByteString,
+    -- | sampling rate for individual samples
     sampling :: !Int
   }
 
+-- | Handle to a gauge. Create with 'System.Metrics.StatsD.newStatGauge'.
 data StatGauge = StatGauge
-  { stats :: !Stats,
+  { -- | client the gauge belongs to
+    stats :: !Stats,
+    -- | metric key
     key :: !ByteString
   }
 
+-- | Handle to a timing metric. Create with
+-- 'System.Metrics.StatsD.newStatTiming'.
 data StatTiming = StatTiming
-  { stats :: !Stats,
+  { -- | client the timing belongs to
+    stats :: !Stats,
+    -- | metric key
     key :: !ByteString,
+    -- | sampling rate for individual samples
     sampling :: !Int
   }
 
+-- | Handle to a set. Create with 'System.Metrics.StatsD.newStatSet'.
 data StatSet = StatSet
-  { stats :: !Stats,
+  { -- | client the set belongs to
+    stats :: !Stats,
+    -- | metric key
     key :: !ByteString
   }
 
+-- | Add a metric with its initial data to the map. The data is only kept if
+-- statistics are reported.
 addMetric :: StatParams -> ByteString -> MetricData -> Metrics -> Metrics
 addMetric params key dat =
   HashMap.insert key $
     Store 0 $
       if params.stats then Just dat else Nothing
 
+-- | Register a metric. Throws an 'IOError' if the key is invalid or already
+-- registered.
 newMetric :: (MonadIO m) => Stats -> ByteString -> MetricData -> m ()
 newMetric stats key store = do
   unless (validateKey key) $ do
@@ -201,11 +294,16 @@ newMetric stats key store = do
         return False
   when e $ throwIO $ userError $ "StatsD key exists: " <> C.unpack key
 
+-- | A key is valid if it is not empty and only contains ASCII letters, digits,
+-- @.@, @_@ and @-@.
 validateKey :: ByteString -> Bool
 validateKey t = not (C.null t) && C.all valid t
   where
     valid c = elem c ("._-" :: [Char]) || isAscii c && isAlphaNum c
 
+-- | Apply a reading to the aggregated data of a metric and increment its reading
+-- count. Relative gauge changes saturate at 'maxBound' and never go below zero.
+-- Calls 'error' if the reading does not match the type of the metric.
 addReading :: Value -> ByteString -> Metrics -> Metrics
 addReading reading = HashMap.adjust adjust
   where
@@ -224,12 +322,16 @@ addReading reading = HashMap.adjust adjust
         SetData (HashSet.insert e s)
       _ -> error "Stats reading mismatch"
 
+-- | Apply a reading and return the updated reading count of the metric, or
+-- @0@ if the metric does not exist.
 newReading :: Stats -> ByteString -> Value -> STM Int
 newReading stats key reading = do
   modifyTVar stats.metrics (addReading reading key)
   maybe 0 (.index) . HashMap.lookup key
     <$> readTVar stats.metrics
 
+-- | Record a reading and, if samples are reported, send it subject to the
+-- sampling rate.
 processSample ::
   (MonadIO m) => Stats -> Int -> ByteString -> Value -> m ()
 processSample stats sampling key val = do
@@ -238,9 +340,12 @@ processSample stats sampling key val = do
     submit stats $
       Sample key val sampling idx
 
+-- | Create an empty set of metrics.
 newMetrics :: (MonadIO m) => m (TVar Metrics)
 newMetrics = newTVarIO HashMap.empty
 
+-- | Validate a configuration and derive its parameters. Calls 'error' if the
+-- configuration is invalid.
 newParams :: StatConfig -> StatParams
 newParams cfg
   | valid =
@@ -275,6 +380,7 @@ newParams cfg
         else namespace <> "."
     full_pfx_stats = pfx_namespace <> pfx_stats <> "."
 
+-- | Build a client handle from its parts.
 newStats :: StatConfig -> TVar Metrics -> Socket -> Stats
 newStats cfg metrics socket =
   Stats
@@ -283,17 +389,21 @@ newStats cfg metrics socket =
       params = newParams cfg
     }
 
+-- | Flush statistics every flush interval, forever.
 statsLoop :: (MonadIO m) => Stats -> m ()
 statsLoop stats = forever $ do
   threadDelay (stats.params.flush * 1000)
   statsFlush stats
 
+-- | Send the statistics of all metrics and reset them.
 statsFlush :: (MonadIO m) => Stats -> m ()
 statsFlush stats = do
   mapM_ (send stats)
     =<< atomically
       (stateTVar stats.metrics (flushStats stats.params))
 
+-- | Compute the reports for all metrics and the metrics reset for the next
+-- interval.
 flushStats :: StatParams -> Metrics -> ([Report], Metrics)
 flushStats params metrics =
   let f xs key m = maybe xs ((<> xs) . statReports params key) m.dat
@@ -302,9 +412,11 @@ flushStats params metrics =
       ms = HashMap.map g metrics
    in (rs, ms)
 
+-- | Join non-empty key parts with dots.
 catKey :: [ByteString] -> ByteString
 catKey = C.intercalate "." . filter (not . C.null)
 
+-- | Reports for the aggregated data of a metric.
 statReports :: StatParams -> ByteString -> MetricData -> [Report]
 statReports params key dat = case dat of
   CounterData c ->
@@ -335,13 +447,19 @@ statReports params key dat = case dat of
     ]
   TimingData s -> timingReports params key s
 
+-- | Sorted timings with precomputed running totals, so that statistics for
+-- any percentile can be read off a prefix of the vectors.
 data TimingStats = TimingStats
-  { timings :: !(Vector Int),
+  { -- | timings in ascending order
+    timings :: !(Vector Int),
+    -- | running sums of the timings
     cumsums :: !(Vector Int),
+    -- | running sums of the squares of the timings
     cumsquares :: !(Vector Int)
   }
   deriving (Eq, Ord, Show, Read)
 
+-- | Sort timings and compute their running totals.
 makeTimingStats :: [Int] -> TimingStats
 makeTimingStats timings =
   TimingStats
@@ -352,12 +470,14 @@ makeTimingStats timings =
   where
     sorted = sort timings
 
+-- | Reports for a timing metric, for every configured percentile.
 timingReports :: StatParams -> ByteString -> [Int] -> [Report]
 timingReports params key timings =
   concatMap (timingStats params key tstats) params.percentiles
   where
     tstats = makeTimingStats timings
 
+-- | Keep only the lowest given percentage of the timings.
 trimPercentile :: Int -> TimingStats -> TimingStats
 trimPercentile pc ts =
   ts
@@ -368,17 +488,21 @@ trimPercentile pc ts =
   where
     f ls = V.take (length ls * pc `div` 100) ls
 
+-- | Suffix for statistics of a percentile: empty for 100, @_N@ otherwise.
 percentileSuffix :: Int -> ByteString
 percentileSuffix pc
   | pc == 100 = ""
   | otherwise = C.pack $ printf "_%d" pc
 
+-- | Turn a count over the flush interval into a count per second.
 computeRate :: StatParams -> Int -> Int
 computeRate params i = i * 1000 `div` params.flush
 
+-- | Integer mean of the timings. Must not be called on empty stats.
 mean :: TimingStats -> Int
 mean ts = V.last ts.cumsums `div` length ts.timings
 
+-- | Reports for a timing metric at one percentile.
 timingStats :: StatParams -> ByteString -> TimingStats -> Int -> [Report]
 timingStats params key tstats pc =
   concat
@@ -400,12 +524,15 @@ timingStats params key tstats pc =
     pfx = params.pfxTimer <> key <> "."
     mkr s v = Report {key = pfx <> s <> sfx, value = v, rate = 1.0}
 
+-- | Running sums of a list.
 cumulativeSums :: (Num a) => [a] -> [a]
 cumulativeSums = scanl1 (+)
 
+-- | Running sums of the squares of a list.
 cumulativeSquares :: (Num a) => [a] -> [a]
 cumulativeSquares = scanl1 (+) . map (\x -> x * x)
 
+-- | Population standard deviation of the timings, rounded.
 stdev :: TimingStats -> Int
 stdev ts =
   round $ sqrt var
@@ -414,6 +541,7 @@ stdev ts =
     var = fromIntegral ds / fromIntegral len :: Double
     ds = sum $ map ((^ (2 :: Int)) . subtract (mean ts)) (V.toList ts.timings)
 
+-- | Median of the timings, or @0@ if there are none.
 median :: TimingStats -> Int
 median ts
   | null ts.timings = 0
@@ -426,12 +554,14 @@ median ts
   where
     middle = length ts.timings `div` 2
 
+-- | Reset aggregated data for the next interval. Gauges keep their value.
 flush :: MetricData -> MetricData
 flush (CounterData _) = CounterData 0
 flush (GaugeData g) = GaugeData g
 flush (TimingData _) = TimingData []
 flush (SetData _) = SetData HashSet.empty
 
+-- | Turn a sample into a report if the sampling rate selects it.
 toReport :: StatParams -> Sample -> Maybe Report
 toReport params sample
   | sample.sampling > 0 && sample.index `mod` sample.sampling == 0 =
@@ -443,6 +573,7 @@ toReport params sample
           }
   | otherwise = Nothing
 
+-- | Encode a report in the StatsD line protocol.
 formatReport :: Report -> ByteString
 formatReport report = L.toStrict $ toLazyByteString builder
   where
@@ -465,10 +596,12 @@ formatReport report = L.toStrict $ toLazyByteString builder
         Set e ->
           byteString e <> "|s"
 
+-- | Send a sample if the sampling rate selects it.
 submit :: (MonadIO m) => Stats -> Sample -> m ()
 submit stats sample =
   forM_ (toReport stats.params sample) (send stats)
 
+-- | Send a report, ignoring network errors.
 send :: (MonadIO m) => Stats -> Report -> m ()
 send stats report =
   liftIO $
@@ -478,6 +611,8 @@ send stats report =
           stats.socket
           (formatReport report <> bool "" "\n" stats.params.newline)
 
+-- | Resolve a host and port and create a UDP socket connected to it. Calls
+-- 'error' if the host cannot be resolved.
 connectStatsD :: (MonadIO m) => String -> Int -> m Socket
 connectStatsD host port = liftIO $ do
   as <-
@@ -492,6 +627,7 @@ connectStatsD host port = liftIO $ do
   Net.connect sock (Net.addrAddress a)
   return sock
 
+-- | Parse a line in the StatsD protocol. The inverse of 'formatReport'.
 parseReport :: (MonadPlus m) => ByteString -> m Report
 parseReport bs =
   case C.split '|' bs of
@@ -532,14 +668,17 @@ parseReport bs =
         return t
       _ -> mzero
 
+-- | Parse a value with its 'Read' instance.
 parseRead :: (MonadPlus m, Read a) => ByteString -> m a
 parseRead = maybe mzero return . readMaybe . C.unpack
 
+-- | Parse a signed integer that takes up the whole string.
 parseInt :: (MonadPlus m) => ByteString -> m Int
 parseInt bs = case C.readInt bs of
   Just (i, bs') | B.null bs' -> return i
   _ -> mzero
 
+-- | Parse a non-negative integer that takes up the whole string.
 parseNatural :: (MonadPlus m) => ByteString -> m Int
 parseNatural bs = case C.readInt bs of
   Just (i, bs') | B.null bs' -> guard (0 <= i) >> return i

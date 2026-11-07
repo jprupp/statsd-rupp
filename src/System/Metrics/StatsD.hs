@@ -30,6 +30,39 @@
 -- All metrics are sent over UDP. Network errors are silently ignored, so that
 -- metrics never break the application.
 --
+-- = Purpose
+--
+-- Metrics tell you what a running program is doing: how many requests it
+-- serves, how long they take, how full its queues are. StatsD is a simple and
+-- widely supported way to ship them: one line of text per sample, sent over
+-- UDP to a daemon that aggregates and forwards them.
+--
+-- The aggregation mode exists because not every collector aggregates. Some
+-- accept the StatsD line protocol but store whatever they receive, so a busy
+-- service sending one line per request floods them. Aggregating in the process
+-- and sending a fixed set of statistics once per interval keeps the traffic
+-- constant however busy the program is, and puts percentiles in reach of
+-- backends that cannot compute them.
+--
+-- = Design
+--
+-- * __Metrics must never hurt the program.__ Sending is fire-and-forget over
+--   UDP and send errors are ignored. A missing or overloaded StatsD server
+--   costs some lost samples, never a failed request.
+--
+-- * __Mistakes in naming fail early.__ Invalid keys, duplicate keys and invalid
+--   configurations are refused when the metric or client is created, not when
+--   the first sample is sent. A typo shows up at start-up instead of as a
+--   missing graph weeks later.
+--
+-- * __Register first, then update cheaply.__ Each metric is created once and
+--   returns a handle. Updating it is an 'STM' update of a map and, when samples
+--   are on, one UDP packet, so it is cheap enough for hot paths.
+--
+-- * __Sampling saves traffic, not accuracy.__ Sampling only thins out the
+--   individual samples sent. The aggregated statistics always count every
+--   reading.
+--
 -- = Example
 --
 -- @
@@ -157,6 +190,10 @@ defStatConfig =
 --
 -- Throws an 'IOError' if the sampling rate is negative, if the key is invalid,
 -- or if a metric with the same key already exists.
+--
+-- Sampling is per metric because traffic is: a counter incremented on every
+-- request needs a low rate, while one incremented on every error can afford to
+-- send everything.
 newStatCounter ::
   (MonadIO m) => Stats -> Key -> Int -> m StatCounter
 newStatCounter stats key sampling = do
@@ -246,6 +283,10 @@ newSetElement StatSet {..} =
 -- not a valid key, if 'flushInterval' is not positive, or if a percentile is not
 -- strictly between 0 and 100. Also fails if the server address cannot be
 -- resolved.
+--
+-- A scope rather than a global client keeps the background flusher's lifetime
+-- explicit, and makes it possible to run several independent clients in one
+-- program, for example in tests.
 withStats :: (MonadUnliftIO m) => StatConfig -> (Stats -> m a) -> m a
 withStats cfg go = do
   metrics <- newMetrics

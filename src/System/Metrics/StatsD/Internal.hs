@@ -21,6 +21,15 @@
 -- per-metric counter, which is used to decide which samples to send when
 -- sampling. A background loop ('statsLoop') periodically turns the aggregated
 -- data into 'Report's, sends them, and resets the data ('flush').
+--
+-- Keeping every metric in one 'TVar' means a reading is a single short
+-- transaction, and a flush can take a consistent picture of all metrics at once
+-- and reset them atomically, so no reading is counted twice or lost between
+-- intervals.
+--
+-- The parser ('parseReport') is not used by the client. It exists so that the
+-- tests can check that every line the client formats reads back as the same
+-- report.
 module System.Metrics.StatsD.Internal
   ( Stats (..),
     newStats,
@@ -304,6 +313,10 @@ validateKey t = not (C.null t) && C.all valid t
 -- | Apply a reading to the aggregated data of a metric and increment its reading
 -- count. Relative gauge changes saturate at 'maxBound' and never go below zero.
 -- Calls 'error' if the reading does not match the type of the metric.
+--
+-- Gauges saturate rather than wrap around because a gauge that suddenly jumps
+-- from a huge value to zero, or below, would be worse than one stuck at its
+-- maximum.
 addReading :: Value -> ByteString -> Metrics -> Metrics
 addReading reading = HashMap.adjust adjust
   where
@@ -460,6 +473,10 @@ data TimingStats = TimingStats
   deriving (Eq, Ord, Show, Read)
 
 -- | Sort timings and compute their running totals.
+--
+-- Sorting once and keeping running sums lets every percentile's count, sum,
+-- mean and sum of squares be read from a prefix of the vectors in constant time,
+-- instead of recomputing them for each percentile.
 makeTimingStats :: [Int] -> TimingStats
 makeTimingStats timings =
   TimingStats
@@ -602,6 +619,9 @@ submit stats sample =
   forM_ (toReport stats.params sample) (send stats)
 
 -- | Send a report, ignoring network errors.
+--
+-- Errors are ignored on purpose: the alternative, failing the code that recorded
+-- a metric because the network is down, is never what a program wants.
 send :: (MonadIO m) => Stats -> Report -> m ()
 send stats report =
   liftIO $

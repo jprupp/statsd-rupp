@@ -23,9 +23,12 @@ never breaks your program.
 
 ## Contents
 
+- [Why statsd-rupp](#why-statsd-rupp)
+- [Design principles](#design-principles)
 - [Features](#features)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Tutorial: instrumenting a web service](#tutorial-instrumenting-a-web-service)
 - [Concepts](#concepts)
 - [Usage guide](#usage-guide)
 - [Configuration](#configuration)
@@ -34,6 +37,43 @@ never breaks your program.
 - [Development](#development)
 - [Related projects](#related-projects)
 - [License](#license)
+
+## Why statsd-rupp
+
+Metrics are how you find out what a program in production is doing: how many
+requests it handles, how slow they are, how close it is to falling over.
+StatsD is one of the simplest ways to get them out. Each sample is one line of
+text sent over UDP to a collector, so instrumenting code costs almost nothing
+and needs no connection management.
+
+The classic setup has a StatsD daemon next to the program that aggregates
+samples into counts, rates and percentiles before they reach the time series
+database. Many modern collectors accept the StatsD protocol but skip that
+aggregation and store every line they receive. A busy service then floods them
+with one line per request, and percentiles of response times are nowhere to be
+found.
+
+statsd-rupp covers both setups. It can send samples like any StatsD client,
+and it can do the daemon's job inside the process: keep every reading in
+memory, and once per interval send a fixed set of statistics. The traffic stays
+constant however busy the program gets. It was written to monitor
+[Haskoin Store](https://github.com/jprupp/haskoin-store).
+
+## Design principles
+
+- **Metrics never hurt the program.** Sending is fire-and-forget UDP and errors
+  are ignored. A collector that is down costs lost samples, never failed
+  requests.
+- **Mistakes fail early.** Bad keys, duplicate keys and bad configuration are
+  refused when you create the metric or the client, so a typo shows up at
+  start-up, not as a missing graph weeks later.
+- **Register once, update cheaply.** Creating a metric returns a handle;
+  updating it is one short STM transaction and at most one UDP packet.
+- **Sampling saves traffic, not accuracy.** Sampling thins out the samples you
+  send. Aggregated statistics always count every reading.
+- **Familiar names.** Aggregated metrics follow the naming of the StatsD daemon
+  (`stats.counters.x.count`, `stats.timers.x.mean_90`), so existing dashboards
+  and alerts keep working.
 
 ## Features
 
@@ -57,6 +97,23 @@ never breaks your program.
 statsd-rupp is on [Hackage](https://hackage.haskell.org/package/statsd-rupp) and
 in Stackage snapshots. It has no C dependencies. It needs GHC 9.2 or later,
 because it uses `OverloadedRecordDot` and `NoFieldSelectors`.
+
+### Step by step
+
+1. Install [Stack](https://docs.haskellstack.org/) or
+   [Cabal](https://www.haskell.org/cabal/).
+2. Add `statsd-rupp` to the `build-depends` of your package (see below).
+3. Start something that listens for StatsD on UDP port 8125. To see the raw
+   lines while developing, netcat is enough:
+
+   ```sh
+   nc -u -l 8125          # some versions need: nc -u -l -p 8125
+   ```
+
+4. Run the [quick start](#quick-start) program with
+   `statsdServer = "127.0.0.1"`. You should see lines like
+   `myapp.requests:1|c` straight away, and a burst of `myapp.stats.` lines
+   every second.
 
 ### With Cabal
 
@@ -105,6 +162,90 @@ With the default configuration this sends `myapp.requests:1|c`,
 `myapp.users:+1|g` and `myapp.visitors:alice|s` right away. Every second it
 sends `myapp.stats.counters.requests.count`, `myapp.stats.timers.latency.mean`
 and the other statistics listed under [Metric names](#metric-names).
+
+## Tutorial: instrumenting a web service
+
+This shows how to decide what to measure and how, for a typical request
+handler.
+
+### 1. Decide what you need to know
+
+For a service, start with the four questions that most incidents come down to:
+how much traffic, how many errors, how slow, and how saturated. Each maps to a
+metric type:
+
+| Question       | Metric           | Type    |
+| -------------- | ---------------- | ------- |
+| How much?      | `requests`       | counter |
+| How many fail? | `errors`         | counter |
+| How slow?      | `latency`        | timing  |
+| How full?      | `queue.length`   | gauge   |
+
+### 2. Create the metrics at start-up
+
+Create them once, next to the rest of your configuration, and pass the handles
+to the code that needs them:
+
+```haskell
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
+import GHC.Clock (getMonotonicTimeNSec)
+import System.Metrics.StatsD
+import UnliftIO (SomeException, throwIO, try)
+
+data Metrics = Metrics
+  { requests :: StatCounter,
+    errors :: StatCounter,
+    latency :: StatTiming,
+    queue :: StatGauge
+  }
+
+newMetrics :: Stats -> IO Metrics
+newMetrics s =
+  Metrics
+    <$> newStatCounter s "requests" 10 -- busy: send 1 sample in 10
+    <*> newStatCounter s "errors" 1 -- rare: send them all
+    <*> newStatTiming s "latency" 10
+    <*> newStatGauge s "queue.length" 0
+```
+
+The sampling rates follow the traffic: frequent events can be sampled, rare and
+important ones should not be. The aggregated statistics count everything
+either way.
+
+### 3. Record around the work
+
+```haskell
+handle :: Metrics -> Request -> IO Response
+handle m req = do
+  incrementCounter m.requests 1
+  start <- getMonotonicTimeNSec
+  r <- try (serve req)
+  end <- getMonotonicTimeNSec
+  addTiming m.latency (fromIntegral ((end - start) `div` 1000000))
+  case r of
+    Left (e :: SomeException) -> incrementCounter m.errors 1 >> throwIO e
+    Right resp -> return resp
+```
+
+Use a monotonic clock (`GHC.Clock.getMonotonicTimeNSec`) for durations, so that
+clock adjustments do not produce negative or huge timings.
+
+### 4. Choose the mode
+
+- If a real StatsD daemon aggregates for you, turn aggregation off with
+  `reportStats = False` and let it do its job.
+- If your collector stores raw lines, turn samples off with
+  `reportSamples = False` and let the library aggregate.
+- Leave both on while you find out which one your setup needs.
+
+### 5. Read the results
+
+With aggregation, `stats.timers.latency.mean_95` is the average of the fastest
+95% of requests in each interval, `upper_95` is the 95th percentile, and
+`count_ps` is requests per second. Alert on `upper_95` and on the ratio of
+`stats.counters.errors.count` to `stats.counters.requests.count`.
 
 ## Concepts
 
